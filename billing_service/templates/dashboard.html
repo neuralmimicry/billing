@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ dashboard_title }}</title>
+    <link rel="stylesheet" href="{{ url_for('billing_dashboard_asset', filename='dashboard.css') }}">
+    <script>
+      window.NM_BILLING_DASHBOARD = {{ dashboard_bootstrap | tojson }};
+    </script>
+    <script src="{{ url_for('billing_dashboard_asset', filename='dashboard.js') }}" defer></script>
+  </head>
+  <body class="nm-billing-body nm-billing-{{ dashboard_kind }}">
+    <div class="nm-atmosphere" aria-hidden="true"></div>
+    <div class="nm-shell">
+      <aside class="nm-rail">
+        <div class="nm-brand">
+          <div class="nm-brand-mark">NM</div>
+          <div>
+            <p class="nm-eyebrow">NeuralMimicry</p>
+            <h1>Billing Intelligence</h1>
+          </div>
+        </div>
+        <p class="nm-rail-copy">
+          {{ dashboard_copy }}
+        </p>
+        <nav class="nm-nav" aria-label="Billing sections">
+          <button class="nm-nav-link is-active" data-target="summary">Overview</button>
+          <button class="nm-nav-link" data-target="trend">Flow</button>
+          <button class="nm-nav-link" data-target="statements">Statements</button>
+          <button class="nm-nav-link" data-target="transactions">Transactions</button>
+          <button class="nm-nav-link" data-target="anomaly">Anomaly</button>
+          {% if dashboard_kind == 'admin' %}
+          <button class="nm-nav-link" data-target="portfolio">Portfolio</button>
+          <button class="nm-nav-link" data-target="accounts">Accounts</button>
+          {% endif %}
+        </nav>
+        <div class="nm-rail-panel">
+          <span class="nm-panel-label">Session</span>
+          <strong>{{ current_user }}</strong>
+          <span class="nm-role-pill">{{ user_role | upper }}</span>
+        </div>
+        <div class="nm-rail-panel">
+          <span class="nm-panel-label">Route</span>
+          <strong>{{ api_origin_hint }}</strong>
+          <span class="nm-panel-note">Served through the NeuralMimicry split platform.</span>
+        </div>
+        {% if can_switch_dashboard %}
+        <div class="nm-rail-switches">
+          <a href="/billing" class="nm-link-chip{% if dashboard_kind == 'customer' %} is-active{% endif %}">Customer</a>
+          <a href="/billing/admin" class="nm-link-chip{% if dashboard_kind == 'admin' %} is-active{% endif %}">Admin</a>
+        </div>
+        {% endif %}
+      </aside>
+
+      <main class="nm-main">
+        <header class="nm-topbar">
+          <div>
+            <p class="nm-kicker">{{ dashboard_kicker }}</p>
+            <h2 id="nm-dashboard-heading">{{ dashboard_heading }}</h2>
+            <p class="nm-subheading" id="nm-dashboard-summary">Loading NeuralMimicry billing telemetry…</p>
+          </div>
+          <div class="nm-actions">
+            <button id="nm-refresh" class="nm-button nm-button-secondary">Refresh</button>
+            <button id="nm-export-transactions" class="nm-button">Export Transactions</button>
+            <button id="nm-export-statements" class="nm-button nm-button-accent">Export Statements</button>
+          </div>
+        </header>
+
+        <section class="nm-hero-grid" id="summary">
+          <article class="nm-hero-card nm-hero-card-wide">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Live posture</p>
+                <h3>NeuralMimicry billing envelope</h3>
+              </div>
+              <span id="nm-posture-pill" class="nm-status-pill">Loading</span>
+            </div>
+            <div class="nm-hero-body">
+              <div class="nm-score-wrap">
+                <div class="nm-score-ring" id="nm-score-ring">
+                  <span id="nm-score-value">0.00</span>
+                </div>
+                <div>
+                  <p class="nm-metric-caption">Anomaly confidence</p>
+                  <strong id="nm-confidence-value">0.00</strong>
+                  <p class="nm-metric-note" id="nm-score-note">Calculating fuzzy and AARNN signal fusion.</p>
+                </div>
+              </div>
+              <div class="nm-signal-chips" id="nm-top-signals"></div>
+            </div>
+          </article>
+          <article class="nm-hero-card">
+            <p class="nm-card-kicker">Last update</p>
+            <h3 id="nm-generated-at">Pending</h3>
+            <p class="nm-card-copy">Telemetry, statements, and recommendations refresh from the chain-backed ledger.</p>
+          </article>
+          <article class="nm-hero-card">
+            <p class="nm-card-kicker">Export surface</p>
+            <h3>CSV-ready</h3>
+            <p class="nm-card-copy">Transaction and statement exports remain first-party and portable.</p>
+          </article>
+        </section>
+
+        <section class="nm-grid nm-grid-summary" id="nm-summary-cards"></section>
+
+        <section class="nm-grid nm-grid-two" id="trend">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Flow</p>
+                <h3>Settlement and usage trend</h3>
+              </div>
+              <span class="nm-panel-meta" id="nm-forecast-copy">Forecast pending</span>
+            </div>
+            <div class="nm-chart-wrap">
+              <svg id="nm-trend-chart" viewBox="0 0 760 280" preserveAspectRatio="none" aria-label="Daily billing trend"></svg>
+            </div>
+            <div class="nm-legend" id="nm-trend-legend"></div>
+          </article>
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Service mix</p>
+                <h3>Product and service pressure</h3>
+              </div>
+              <span class="nm-panel-meta">Recent share</span>
+            </div>
+            <div id="nm-service-breakdown" class="nm-breakdown-list"></div>
+          </article>
+        </section>
+
+        <section class="nm-grid nm-grid-two" id="statements">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Statements</p>
+                <h3>Billing periods</h3>
+              </div>
+              <span class="nm-panel-meta">Invoice-equivalent periods</span>
+            </div>
+            <div class="nm-table-wrap">
+              <table class="nm-table">
+                <thead>
+                  <tr>
+                    <th>Period</th>
+                    <th>Top-ups</th>
+                    <th>Usage</th>
+                    <th>Settlement</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="nm-statements-table"></tbody>
+              </table>
+            </div>
+          </article>
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Settlement routes</p>
+                <h3>Payment methods</h3>
+              </div>
+              <span class="nm-panel-meta">Recent paths</span>
+            </div>
+            <div id="nm-payment-methods" class="nm-method-grid"></div>
+          </article>
+        </section>
+
+        <section class="nm-grid" id="transactions">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Ledger window</p>
+                <h3>Recent transactions</h3>
+              </div>
+              <span class="nm-panel-meta">Chain-backed entries</span>
+            </div>
+            <div class="nm-table-wrap">
+              <table class="nm-table">
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Activity</th>
+                    <th>Service</th>
+                    <th>Tokens</th>
+                    <th>Settlement</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="nm-transactions-table"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="nm-grid nm-grid-two" id="anomaly">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Signals</p>
+                <h3>Fuzzy and AARNN outputs</h3>
+              </div>
+              <span class="nm-panel-meta">NeuralMimicry native controls</span>
+            </div>
+            <div class="nm-signal-matrix" id="nm-signal-matrix"></div>
+            <div class="nm-ai-grid">
+              <div>
+                <p class="nm-panel-label">Fuzzy risk</p>
+                <strong id="nm-fuzzy-risk">0.00</strong>
+                <span id="nm-fuzzy-meta" class="nm-panel-note">Type-n envelope pending</span>
+              </div>
+              <div>
+                <p class="nm-panel-label">AARNN drift</p>
+                <strong id="nm-ai-risk">0.00</strong>
+                <span id="nm-ai-meta" class="nm-panel-note">Neuromimic state pending</span>
+              </div>
+            </div>
+          </article>
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Actions</p>
+                <h3>Recommended operator response</h3>
+              </div>
+              <span class="nm-panel-meta">Human-readable guidance</span>
+            </div>
+            <div id="nm-recommendations" class="nm-recommendations"></div>
+            <div class="nm-inline-actions" id="nm-inline-actions"></div>
+          </article>
+        </section>
+
+        {% if dashboard_kind == 'admin' %}
+        <section class="nm-grid nm-grid-two" id="portfolio">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Portfolio</p>
+                <h3>Recent account portfolio</h3>
+              </div>
+              <span class="nm-panel-meta" id="nm-portfolio-meta">Observed chain window</span>
+            </div>
+            <div class="nm-grid nm-grid-summary" id="nm-portfolio-cards"></div>
+          </article>
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Providers</p>
+                <h3>Settlement concentration</h3>
+              </div>
+              <span class="nm-panel-meta">Recent payment mix</span>
+            </div>
+            <div id="nm-provider-breakdown" class="nm-breakdown-list"></div>
+          </article>
+        </section>
+
+        <section class="nm-grid nm-grid-two" id="accounts">
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Accounts</p>
+                <h3>Highest-movement accounts</h3>
+              </div>
+              <span class="nm-panel-meta">Movement and balance posture</span>
+            </div>
+            <div class="nm-table-wrap">
+              <table class="nm-table">
+                <thead>
+                  <tr>
+                    <th>Account</th>
+                    <th>Movement</th>
+                    <th>Balance</th>
+                    <th>Risk</th>
+                    <th>Posture</th>
+                  </tr>
+                </thead>
+                <tbody id="nm-top-accounts-table"></tbody>
+              </table>
+            </div>
+          </article>
+          <article class="nm-panel">
+            <div class="nm-card-head">
+              <div>
+                <p class="nm-card-kicker">Queue</p>
+                <h3>Anomaly review queue</h3>
+              </div>
+              <span class="nm-panel-meta">Accounts requiring attention</span>
+            </div>
+            <div id="nm-anomaly-queue" class="nm-queue-list"></div>
+          </article>
+        </section>
+        {% endif %}
+      </main>
+    </div>
+  </body>
+</html>
