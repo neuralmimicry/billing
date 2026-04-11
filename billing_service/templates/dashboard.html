@@ -39,6 +39,12 @@
           <span class="nm-panel-label">Session</span>
           <strong>{{ current_user }}</strong>
           <span class="nm-role-pill">{{ user_role | upper }}</span>
+          {% if user_groups %}
+          <span class="nm-panel-note">Groups: {{ user_groups | join(', ') }}</span>
+          {% endif %}
+          {% if active_team_label %}
+          <span class="nm-panel-note">Active team: {{ active_team_label }}</span>
+          {% endif %}
         </div>
         <div class="nm-rail-panel">
           <span class="nm-panel-label">Route</span>

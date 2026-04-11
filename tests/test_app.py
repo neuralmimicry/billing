@@ -451,6 +451,36 @@ def test_admin_dashboard_routes(monkeypatch):
     assert forbidden_response.status_code == 403
 
 
+def test_admin_dashboard_accepts_admin_group(monkeypatch):
+    app = _build_app(monkeypatch)
+    client = app.test_client()
+
+    response = client.get(
+        "/api/billing/dashboard/admin",
+        headers={
+            "X-Debug-User": "operator",
+            "X-Debug-Role": "user",
+            "X-Debug-Groups": "user,admin",
+        },
+    )
+
+    assert response.status_code == 200
+
+    html_response = client.get(
+        "/billing",
+        headers={
+            "X-Debug-User": "operator",
+            "X-Debug-Role": "user",
+            "X-Debug-Groups": "user,admin",
+            "X-Debug-Active-Team": "platform",
+        },
+    )
+    assert html_response.status_code == 200
+    body = html_response.get_data(as_text=True)
+    assert "Groups: user, admin" in body
+    assert "Active team: platform" in body
+
+
 def test_dashboard_html_redirects_when_unauthenticated(monkeypatch):
     app = _build_app(monkeypatch, auth_open=False)
     client = app.test_client()

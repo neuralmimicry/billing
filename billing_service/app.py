@@ -95,7 +95,17 @@ def _identity_from_request() -> Optional[Dict[str, Any]]:
     if _settings().auth_open:
         user = (request.headers.get("X-Debug-User") or "developer").strip()
         role = (request.headers.get("X-Debug-Role") or "admin").strip() or "admin"
-        return {"authenticated": True, "user": user, "role": role}
+        groups = _coerce_identity_groups(request.headers.get("X-Debug-Groups"))
+        active_team = _normalize_active_team(request.headers.get("X-Debug-Active-Team"))
+        return _normalize_identity(
+            {
+                "authenticated": True,
+                "user": user,
+                "role": role,
+                "groups": groups,
+                "active_team": active_team,
+            }
+        )
     client = _customers()
     if not client:
         if _settings().require_customers:
@@ -106,7 +116,7 @@ def _identity_from_request() -> Optional[Dict[str, Any]]:
         cookie_header=request.headers.get("Cookie"),
     )
     if payload.get("authenticated"):
-        return payload
+        return _normalize_identity(payload)
     return None
 
 
@@ -116,6 +126,84 @@ def _verify_password(username: str, password: str) -> bool:
         return _settings().auth_open
     payload = client.verify_credentials(username, password)
     return bool(payload.get("authenticated"))
+
+
+def _coerce_identity_groups(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw_values = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw_values = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_values:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(lowered)
+    return normalized
+
+
+def _coerce_optional_int(value: Any, default: int = 0) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _normalize_active_team(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        payload = dict(value)
+        team_id = str(payload.get("team_id") or payload.get("id") or "").strip()
+        if not team_id:
+            return None
+        payload["team_id"] = team_id
+        return payload
+    if isinstance(value, str):
+        team_id = value.strip()
+        if team_id:
+            return {"team_id": team_id}
+    return None
+
+
+def _normalize_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    user = str(payload.get("user") or "").strip()
+    if not user:
+        return None
+    role = str(payload.get("role") or "user").strip().lower() or "user"
+    groups = _coerce_identity_groups(payload.get("groups"))
+    if role and role not in groups:
+        groups.insert(0, role)
+    active_team = _normalize_active_team(payload.get("active_team"))
+    return {
+        **payload,
+        "authenticated": bool(payload.get("authenticated")),
+        "user": user,
+        "role": role,
+        "groups": groups,
+        "active_team": active_team,
+        "team_count": _coerce_optional_int(payload.get("team_count"), 1 if active_team else 0),
+        "pending_invitation_count": _coerce_optional_int(payload.get("pending_invitation_count"), 0),
+        "is_admin": role == "admin" or "admin" in groups,
+    }
+
+
+def _active_team_label(identity: Optional[Dict[str, Any]]) -> Optional[str]:
+    active_team = identity.get("active_team") if isinstance(identity, dict) else None
+    if not isinstance(active_team, dict):
+        return None
+    return (
+        str(active_team.get("team_name") or "").strip()
+        or str(active_team.get("name") or "").strip()
+        or str(active_team.get("team_id") or "").strip()
+        or None
+    )
 
 
 def _normalize_snapshot(snapshot: Dict[str, Any], *, include_btc_rate: bool = False) -> Dict[str, Any]:
@@ -188,11 +276,19 @@ def _api_origin_hint() -> str:
     return host or "billing.internal"
 
 
-def _dashboard_bootstrap(kind: str, *, role: str) -> Dict[str, Any]:
+def _dashboard_bootstrap(kind: str, *, identity: Dict[str, Any]) -> Dict[str, Any]:
+    groups = identity.get("groups") if isinstance(identity.get("groups"), list) else []
     return {
         "kind": kind,
-        "identity": {"role": role},
-        "can_switch_dashboard": role == "admin",
+        "identity": {
+            "user": identity.get("user"),
+            "role": identity.get("role"),
+            "groups": groups,
+            "active_team": identity.get("active_team"),
+            "team_count": identity.get("team_count"),
+            "pending_invitation_count": identity.get("pending_invitation_count"),
+        },
+        "can_switch_dashboard": bool(identity.get("is_admin")),
         "endpoints": {
             "data": "/api/billing/dashboard/customer" if kind == "customer" else "/api/billing/dashboard/admin",
             "customer": "/billing",
@@ -272,19 +368,20 @@ def create_app() -> Flask:
             return make_response("Authentication backend unavailable.", 503)
         if not identity or not identity.get("user"):
             return _login_redirect()
-        role = str(identity.get("role") or "user").strip() or "user"
         return make_response(
             render_template(
                 "dashboard.html",
                 dashboard_title="NeuralMimicry Billing Intelligence",
                 dashboard_kind="customer",
-                dashboard_bootstrap=_dashboard_bootstrap("customer", role=role),
+                dashboard_bootstrap=_dashboard_bootstrap("customer", identity=identity),
                 dashboard_copy="Watch balances, settlement routes, token flow, and anomaly posture without leaving NeuralMimicry's billing boundary.",
                 dashboard_kicker="Customer dashboard",
                 dashboard_heading="Billing envelope and settlement activity",
                 current_user=str(identity.get("user") or "").strip(),
-                user_role=role,
-                can_switch_dashboard=role == "admin",
+                user_role=str(identity.get("role") or "user"),
+                user_groups=identity.get("groups") or [],
+                active_team_label=_active_team_label(identity),
+                can_switch_dashboard=bool(identity.get("is_admin")),
                 api_origin_hint=_api_origin_hint(),
             )
         )
@@ -298,20 +395,21 @@ def create_app() -> Flask:
             return make_response("Authentication backend unavailable.", 503)
         if not identity or not identity.get("user"):
             return _login_redirect()
-        role = str(identity.get("role") or "user").strip() or "user"
-        if role != "admin":
+        if not bool(identity.get("is_admin")):
             return make_response("Admin role required.", 403)
         return make_response(
             render_template(
                 "dashboard.html",
                 dashboard_title="NeuralMimicry Billing Control Plane",
                 dashboard_kind="admin",
-                dashboard_bootstrap=_dashboard_bootstrap("admin", role=role),
+                dashboard_bootstrap=_dashboard_bootstrap("admin", identity=identity),
                 dashboard_copy="Track portfolio movement, provider concentration, and the anomaly review queue from a chain-backed operator surface.",
                 dashboard_kicker="Admin dashboard",
                 dashboard_heading="Portfolio control and billing anomaly queue",
                 current_user=str(identity.get("user") or "").strip(),
-                user_role=role,
+                user_role=str(identity.get("role") or "user"),
+                user_groups=identity.get("groups") or [],
+                active_team_label=_active_team_label(identity),
                 can_switch_dashboard=True,
                 api_origin_hint=_api_origin_hint(),
             )
@@ -360,8 +458,7 @@ def create_app() -> Flask:
             return jsonify({"error": "auth_unavailable"}), 503
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
-        role = str(identity.get("role") or "user").strip() or "user"
-        if role != "admin":
+        if not bool(identity.get("is_admin")):
             return jsonify({"error": "forbidden"}), 403
         try:
             payload = _admin_dashboard_payload()
@@ -380,7 +477,6 @@ def create_app() -> Flask:
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
         user = str(identity.get("user") or "").strip()
-        role = str(identity.get("role") or "user").strip() or "user"
         try:
             snapshot = _user_snapshot(user)
         except NmChainError as exc:
@@ -484,7 +580,7 @@ def create_app() -> Flask:
             return jsonify({"message": "Cashout recorded.", **_user_snapshot(user)})
 
         if action == "grant":
-            if role != "admin":
+            if not bool(identity.get("is_admin")):
                 return jsonify({"error": "forbidden", "details": "Admin role required."}), 403
             target_user = str(payload.get("target_user") or payload.get("recipient") or payload.get("username") or "").strip()
             if not target_user:
@@ -634,9 +730,8 @@ def create_app() -> Flask:
             return jsonify({"error": "unauthorized"}), 401
         target = str(request.args.get("user") or "").strip()
         user = str(identity.get("user") or "").strip()
-        role = str(identity.get("role") or "user").strip() or "user"
         if target:
-            if role != "admin":
+            if not bool(identity.get("is_admin")):
                 return jsonify({"error": "forbidden"}), 403
             user = target
         try:
