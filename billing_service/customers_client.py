@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -48,6 +49,14 @@ class CustomersClient:
             "POST",
             "/api/internal/credentials/verify",
             json_body={"username": username, "password": password},
+            require_app_auth=True,
+        )
+
+    def get_user(self, username: str) -> Dict[str, Any]:
+        cleaned = str(username or "").strip()
+        return self._request(
+            "GET",
+            f"/api/internal/users/{quote(cleaned)}",
             require_app_auth=True,
         )
 

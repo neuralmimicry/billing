@@ -196,13 +196,28 @@
       const summary = payload.summary || {};
       setText(
         "nm-dashboard-summary",
-        "Balance " + formatTokens(summary.balance_tokens) + " with " + formatTokens(summary.debit_tokens_30d) + " used in the recent 30-day billing window."
+        "Balance "
+          + formatTokens(summary.balance_tokens)
+          + " with "
+          + formatTokens(summary.debit_tokens_30d)
+          + " used, "
+          + formatTokens(summary.transfer_out_tokens_30d)
+          + " transferred out, and "
+          + formatTokens(summary.transfer_in_tokens_30d)
+          + " received in the recent 30-day billing window."
       );
     } else {
       const portfolio = payload.portfolio || {};
       setText(
         "nm-dashboard-summary",
-        formatCount(portfolio.observed_accounts) + " active accounts observed in the chain window with " + formatCount(portfolio.anomalies_open) + " review-grade anomalies open."
+        formatCount(portfolio.observed_accounts)
+          + " active accounts observed in the chain window with "
+          + formatCount(portfolio.anomalies_open)
+          + " review-grade anomalies open, "
+          + formatTokens(portfolio.recent_transfer_out_tokens)
+          + " transferred out, and "
+          + formatTokens(portfolio.recent_transfer_in_tokens)
+          + " received."
       );
     }
 
@@ -235,6 +250,8 @@
       cards.push(buildMetricCard("Available", formatTokens(summary.available_tokens), "Reserved " + formatTokens(summary.reserved_tokens)));
       cards.push(buildMetricCard("30d usage", formatTokens(summary.debit_tokens_30d), "Lifetime spent " + formatTokens(summary.spent_total_tokens)));
       cards.push(buildMetricCard("30d settlement", formatMoney(summary.payment_minor_30d), "Top-ups " + formatTokens(summary.topup_tokens_30d)));
+      cards.push(buildMetricCard("Transfers in", formatTokens(summary.transfer_in_tokens_30d), "Grants " + formatTokens(summary.grant_tokens_30d) + " / refunds " + formatTokens(summary.refund_tokens_30d)));
+      cards.push(buildMetricCard("Transfers out", formatTokens(summary.transfer_out_tokens_30d), "Cash-outs " + formatTokens(summary.cashout_tokens_30d)));
       cards.push(buildMetricCard("Cash-out total", formatTokens(summary.cashout_total_tokens), "Free grants " + formatTokens(summary.free_grant_total_tokens)));
       cards.push(buildMetricCard("Month forecast", formatMoney(forecast.projected_payment_minor), "Projected usage " + formatTokens(forecast.projected_debit_tokens)));
     } else {
@@ -244,6 +261,8 @@
       cards.push(buildMetricCard("Observed accounts", formatCount(portfolio.observed_accounts), "Window " + formatCount(portfolio.window_blocks) + " blocks"));
       cards.push(buildMetricCard("Recent usage", formatTokens(portfolio.recent_debit_tokens), "Top-ups " + formatTokens(portfolio.recent_topup_tokens)));
       cards.push(buildMetricCard("Recent settlements", formatMoney(portfolio.recent_payment_minor), "Cash-outs " + formatTokens(portfolio.recent_cashout_tokens)));
+      cards.push(buildMetricCard("Transfers in", formatTokens(portfolio.recent_transfer_in_tokens), "Recent grants " + formatTokens(portfolio.recent_grant_tokens)));
+      cards.push(buildMetricCard("Transfers out", formatTokens(portfolio.recent_transfer_out_tokens), "Recent cash-outs " + formatTokens(portfolio.recent_cashout_tokens)));
       cards.push(buildMetricCard("Open anomalies", formatCount(portfolio.anomalies_open), "Portfolio posture " + humanize(portfolio.posture || "clear")));
       cards.push(buildMetricCard("Chain height", formatCount(chain.height), "Tracked accounts " + formatCount(chain.account_count)));
       cards.push(buildMetricCard("Month forecast", formatMoney(forecast.projected_payment_minor), "Projected usage " + formatTokens(forecast.projected_debit_tokens)));
@@ -288,7 +307,9 @@
     const height = 280;
     const seriesDefs = [
       { key: "topup_tokens", label: "Top-ups", color: "#f57039" },
+      { key: "transfer_in_tokens", label: "Transfers in", color: "#7cc9ff" },
       { key: "debit_tokens", label: "Usage", color: "#57d0d1" },
+      { key: "transfer_out_tokens", label: "Transfers out", color: "#ffd37b" },
       { key: "cashout_tokens", label: "Cash-outs", color: "#9ee380" },
     ];
     const maxValue = Math.max(1, ...daily.flatMap(function (item) {
@@ -345,8 +366,11 @@
     const totalUsage = daily.reduce(function (sum, item) {
       return sum + valueAsNumber(item.debit_tokens);
     }, 0);
+    const totalTransfersOut = daily.reduce(function (sum, item) {
+      return sum + valueAsNumber(item.transfer_out_tokens);
+    }, 0);
     if (forecastCopy) {
-      forecastCopy.textContent = "Top-ups " + formatTokens(totalTopups) + " vs usage " + formatTokens(totalUsage) + " in the visible window.";
+      forecastCopy.textContent = "Top-ups " + formatTokens(totalTopups) + " vs usage " + formatTokens(totalUsage) + " and transfers out " + formatTokens(totalTransfersOut) + " in the visible window.";
     }
   }
 
@@ -382,7 +406,7 @@
     if (!Array.isArray(statements) || !statements.length) {
       const row = createNode("tr");
       const cell = createNode("td", "nm-empty", "No statement periods available.");
-      cell.colSpan = 5;
+      cell.colSpan = 7;
       row.appendChild(cell);
       node.appendChild(row);
       return;
@@ -394,7 +418,9 @@
       periodCell.appendChild(createNode("div", "nm-panel-note", humanize(statement.top_service || statement.provider || "ledger window")));
       row.appendChild(periodCell);
       row.appendChild(createNode("td", "", formatTokens(statement.topup_tokens)));
+      row.appendChild(createNode("td", "", formatTokens(statement.transfer_in_tokens)));
       row.appendChild(createNode("td", "", formatTokens(statement.debit_tokens)));
+      row.appendChild(createNode("td", "", formatTokens(statement.transfer_out_tokens)));
       row.appendChild(createNode("td", "", formatMoney(statement.payment_minor, statement.currency)));
       const statusCell = createNode("td", "", humanize(statement.status || "settled"));
       setTone(statusCell, toneFromRisk({ settled: 0.12, watch: 0.45, review: 0.7 }[String(statement.status || "settled")] || 0.12));
@@ -448,7 +474,20 @@
       row.appendChild(createNode("td", "", formatTokens(transaction.delta_tokens)));
       row.appendChild(createNode("td", "", transaction.payment_minor ? formatMoney(transaction.payment_minor, transaction.currency) : "-"));
       const statusCell = createNode("td", "", humanize(transaction.status || "posted"));
-      setTone(statusCell, toneFromRisk(transaction.shortfall_tokens ? 0.8 : transaction.entry_type === "cashout" ? 0.68 : transaction.entry_type === "debit" ? 0.34 : 0.16));
+      setTone(
+        statusCell,
+        toneFromRisk(
+          transaction.shortfall_tokens
+            ? 0.8
+            : transaction.entry_type === "cashout"
+              ? 0.68
+              : transaction.entry_type === "transfer_out"
+                ? 0.42
+                : transaction.entry_type === "debit"
+                  ? 0.34
+                  : 0.16
+        )
+      );
       row.appendChild(statusCell);
       node.appendChild(row);
     });
@@ -537,6 +576,8 @@
       [
         buildMetricCard("Top-ups", formatTokens(portfolio.recent_topup_tokens), "Recent grants " + formatTokens(portfolio.recent_grant_tokens)),
         buildMetricCard("Usage", formatTokens(portfolio.recent_debit_tokens), "Cash-outs " + formatTokens(portfolio.recent_cashout_tokens)),
+        buildMetricCard("Transfers in", formatTokens(portfolio.recent_transfer_in_tokens), "Recent peer receipts"),
+        buildMetricCard("Transfers out", formatTokens(portfolio.recent_transfer_out_tokens), "Recent peer sends"),
         buildMetricCard("Settlement", formatMoney(portfolio.recent_payment_minor), "BTC rate " + String(portfolio.btc_rate || "-")),
         buildMetricCard("Portfolio risk", formatScore(portfolio.risk), "Posture " + humanize(portfolio.posture || "clear")),
       ].forEach(function (card) {
@@ -745,12 +786,14 @@
     if (exportStatements) {
       exportStatements.addEventListener("click", function () {
         const statements = Array.isArray(state.payload?.statements) ? state.payload.statements : [];
-        const rows = [["Period", "Top-ups", "Usage", "Settlement", "Status", "Provider", "Top service"]];
+        const rows = [["Period", "Top-ups", "Transfers in", "Usage", "Transfers out", "Settlement", "Status", "Provider", "Top service"]];
         statements.forEach(function (statement) {
           rows.push([
             statement.label || statement.period || "",
             String(statement.topup_tokens || 0),
+            String(statement.transfer_in_tokens || 0),
             String(statement.debit_tokens || 0),
+            String(statement.transfer_out_tokens || 0),
             formatMoney(statement.payment_minor, statement.currency),
             statement.status || "",
             statement.provider || "",

@@ -80,6 +80,10 @@ def infer_service_label(activity: Mapping[str, Any]) -> str:
     operation = _safe_str(meta.get("operation") or meta.get("workspace_id") or meta.get("checkout_flow")).lower()
     entry_type = _safe_str(activity.get("entry_type")).lower()
 
+    if entry_type == "transfer_in":
+        return "Peer token transfer in"
+    if entry_type == "transfer_out":
+        return "Peer token transfer out"
     if entry_type == "cashout":
         return "Cash-out settlement"
     if meta.get("payment_provider") or meta.get("payment_id") or entry_type == "topup":
@@ -115,6 +119,10 @@ def _activity_title(entry_type: str, meta: Mapping[str, Any]) -> str:
         return "Token top-up" if payment_provider else "Balance top-up"
     if entry_type == "grant":
         return "Token grant"
+    if entry_type == "transfer_in":
+        return "Token transfer received"
+    if entry_type == "transfer_out":
+        return "Token transfer sent"
     if entry_type == "refund":
         return "Token refund"
     if entry_type == "cashout":
@@ -135,7 +143,7 @@ def _activity_title(entry_type: str, meta: Mapping[str, Any]) -> str:
 def _activity_status(entry_type: str, shortfall: int, delta_tokens: int) -> str:
     if shortfall > 0:
         return "partial"
-    if entry_type in {"topup", "grant", "refund"}:
+    if entry_type in {"topup", "grant", "refund", "transfer_in", "transfer_out"}:
         return "settled"
     if entry_type == "cashout":
         return "queued"
@@ -163,7 +171,27 @@ def _normalise_activity_record(record: Mapping[str, Any]) -> dict[str, Any]:
     service_label = infer_service_label({**record, "meta": meta, "entry_type": entry_type})
     reference = _safe_str(record.get("reference") or record.get("request_id") or meta.get("payment_id") or record.get("tx_id"))
     title = _activity_title(entry_type, meta)
-    subtitle = " · ".join(part for part in [payment_method.title() if payment_method else "", provider.title() if provider else "", service_label] if part)
+    from_user = _safe_str(record.get("from_user") or meta.get("from_user") or meta.get("granted_by"))
+    to_user = _safe_str(record.get("to_user") or meta.get("to_user") or meta.get("recipient") or meta.get("target_user"))
+    note = _safe_str(meta.get("note") or meta.get("reason"))
+    counterparty = ""
+    if entry_type == "transfer_in" and from_user:
+        counterparty = f"From {from_user}"
+    elif entry_type == "transfer_out" and to_user:
+        counterparty = f"To {to_user}"
+    elif entry_type == "grant" and from_user:
+        counterparty = f"Granted by {from_user}"
+    subtitle = " · ".join(
+        part
+        for part in [
+            counterparty,
+            payment_method.title() if payment_method else "",
+            provider.title() if provider else "",
+            service_label,
+            note,
+        ]
+        if part
+    )
     return {
         "ts": ts,
         "account_id": account_id,
@@ -183,6 +211,9 @@ def _normalise_activity_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "subtitle": subtitle,
         "status": _activity_status(entry_type, shortfall, delta_tokens),
         "direction": "in" if delta_tokens > 0 else "out" if delta_tokens < 0 else "flat",
+        "from_user": from_user or None,
+        "to_user": to_user or None,
+        "counterparty": counterparty or None,
         "reference": reference or None,
     }
 
@@ -196,8 +227,8 @@ def normalise_ledger_entries(entries: Sequence[Mapping[str, Any]]) -> list[dict[
                 {
                     "ts": entry.get("ts"),
                     "account_id": entry.get("account_id"),
-                    "account_scope": entry.get("account_scope"),
-                    "entry_type": entry.get("entry_type"),
+                    "account_scope": entry.get("account_scope") or entry.get("scope"),
+                    "entry_type": entry.get("entry_type") if "entry_type" in entry else entry.get("type"),
                     "delta": entry.get("delta"),
                     "shortfall": entry.get("shortfall"),
                     "actor_app": entry.get("actor_app"),
@@ -285,10 +316,14 @@ def build_daily_points(
         buckets[day_key] = {
             "date": day_key,
             "topup_tokens": 0,
+            "transfer_in_tokens": 0,
             "debit_tokens": 0,
+            "transfer_out_tokens": 0,
             "cashout_tokens": 0,
             "grant_tokens": 0,
             "refund_tokens": 0,
+            "inflow_tokens": 0,
+            "outflow_tokens": 0,
             "shortfall_tokens": 0,
             "payment_minor": 0,
             "event_count": 0,
@@ -316,14 +351,25 @@ def build_daily_points(
             provider_sets[day_key].add(_safe_str(activity.get("provider")).lower())
         if entry_type == "topup":
             bucket["topup_tokens"] += max(delta_tokens, 0)
+            bucket["inflow_tokens"] += max(delta_tokens, 0)
+        elif entry_type == "transfer_in":
+            bucket["transfer_in_tokens"] += max(delta_tokens, 0)
+            bucket["inflow_tokens"] += max(delta_tokens, 0)
         elif entry_type == "debit":
             bucket["debit_tokens"] += abs(delta_tokens)
+            bucket["outflow_tokens"] += abs(delta_tokens)
+        elif entry_type == "transfer_out":
+            bucket["transfer_out_tokens"] += abs(delta_tokens)
+            bucket["outflow_tokens"] += abs(delta_tokens)
         elif entry_type == "cashout":
             bucket["cashout_tokens"] += abs(delta_tokens)
+            bucket["outflow_tokens"] += abs(delta_tokens)
         elif entry_type == "grant":
             bucket["grant_tokens"] += max(delta_tokens, 0)
+            bucket["inflow_tokens"] += max(delta_tokens, 0)
         elif entry_type == "refund":
             bucket["refund_tokens"] += max(delta_tokens, 0)
+            bucket["inflow_tokens"] += max(delta_tokens, 0)
 
     for day_key, providers in provider_sets.items():
         buckets[day_key]["provider_count"] = len(providers)
@@ -345,10 +391,14 @@ def build_statements(activities: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 "period": period,
                 "label": _month_label(period),
                 "topup_tokens": 0,
+                "transfer_in_tokens": 0,
                 "debit_tokens": 0,
+                "transfer_out_tokens": 0,
                 "cashout_tokens": 0,
                 "grant_tokens": 0,
                 "refund_tokens": 0,
+                "inflow_tokens": 0,
+                "outflow_tokens": 0,
                 "payment_minor": 0,
                 "currency": _safe_str(activity.get("currency") or "GBP") or "GBP",
                 "event_count": 0,
@@ -368,15 +418,26 @@ def build_statements(activities: Sequence[Mapping[str, Any]]) -> list[dict[str, 
         entry_type = _safe_str(activity.get("entry_type")).lower()
         if entry_type == "topup":
             group["topup_tokens"] += max(delta_tokens, 0)
+            group["inflow_tokens"] += max(delta_tokens, 0)
+        elif entry_type == "transfer_in":
+            group["transfer_in_tokens"] += max(delta_tokens, 0)
+            group["inflow_tokens"] += max(delta_tokens, 0)
         elif entry_type == "debit":
             group["debit_tokens"] += abs(delta_tokens)
+            group["outflow_tokens"] += abs(delta_tokens)
+        elif entry_type == "transfer_out":
+            group["transfer_out_tokens"] += abs(delta_tokens)
+            group["outflow_tokens"] += abs(delta_tokens)
         elif entry_type == "cashout":
             group["cashout_tokens"] += abs(delta_tokens)
+            group["outflow_tokens"] += abs(delta_tokens)
             group["status"] = "review"
         elif entry_type == "grant":
             group["grant_tokens"] += max(delta_tokens, 0)
+            group["inflow_tokens"] += max(delta_tokens, 0)
         elif entry_type == "refund":
             group["refund_tokens"] += max(delta_tokens, 0)
+            group["inflow_tokens"] += max(delta_tokens, 0)
         if _safe_int(activity.get("shortfall_tokens")) > 0:
             group["status"] = "watch"
         if _safe_str(activity.get("ts")) > _safe_str(group.get("latest_ts")):
@@ -391,10 +452,14 @@ def build_statements(activities: Sequence[Mapping[str, Any]]) -> list[dict[str, 
                 "period": period,
                 "label": group["label"],
                 "topup_tokens": group["topup_tokens"],
+                "transfer_in_tokens": group["transfer_in_tokens"],
                 "debit_tokens": group["debit_tokens"],
+                "transfer_out_tokens": group["transfer_out_tokens"],
                 "cashout_tokens": group["cashout_tokens"],
                 "grant_tokens": group["grant_tokens"],
                 "refund_tokens": group["refund_tokens"],
+                "inflow_tokens": group["inflow_tokens"],
+                "outflow_tokens": group["outflow_tokens"],
                 "payment_minor": group["payment_minor"],
                 "payment_major": _money_major(group["payment_minor"]),
                 "currency": group["currency"],
@@ -527,6 +592,13 @@ def build_customer_dashboard(
     payment_minor_30d = sum(_safe_int(item.get("payment_minor")) for item in daily_points)
     debit_tokens_30d = sum(_safe_int(item.get("debit_tokens")) for item in daily_points)
     topup_tokens_30d = sum(_safe_int(item.get("topup_tokens")) for item in daily_points)
+    transfer_in_tokens_30d = sum(_safe_int(item.get("transfer_in_tokens")) for item in daily_points)
+    transfer_out_tokens_30d = sum(_safe_int(item.get("transfer_out_tokens")) for item in daily_points)
+    grant_tokens_30d = sum(_safe_int(item.get("grant_tokens")) for item in daily_points)
+    refund_tokens_30d = sum(_safe_int(item.get("refund_tokens")) for item in daily_points)
+    cashout_tokens_30d = sum(_safe_int(item.get("cashout_tokens")) for item in daily_points)
+    inflow_tokens_30d = sum(_safe_int(item.get("inflow_tokens")) for item in daily_points)
+    outflow_tokens_30d = sum(_safe_int(item.get("outflow_tokens")) for item in daily_points)
 
     recommendations = []
     if anomaly["posture"] in {"review", "intervene"}:
@@ -578,6 +650,13 @@ def build_customer_dashboard(
             "payment_major_30d": _money_major(payment_minor_30d),
             "debit_tokens_30d": debit_tokens_30d,
             "topup_tokens_30d": topup_tokens_30d,
+            "transfer_in_tokens_30d": transfer_in_tokens_30d,
+            "transfer_out_tokens_30d": transfer_out_tokens_30d,
+            "grant_tokens_30d": grant_tokens_30d,
+            "refund_tokens_30d": refund_tokens_30d,
+            "cashout_tokens_30d": cashout_tokens_30d,
+            "inflow_tokens_30d": inflow_tokens_30d,
+            "outflow_tokens_30d": outflow_tokens_30d,
             "forecast": forecast,
             "btc_rate": btc_rate,
             "risk": anomaly["risk"],
@@ -716,6 +795,8 @@ def build_admin_dashboard(
     debit_tokens_recent = sum(_safe_int(item.get("debit_tokens")) for item in daily_points)
     cashout_tokens_recent = sum(_safe_int(item.get("cashout_tokens")) for item in daily_points)
     grant_tokens_recent = sum(_safe_int(item.get("grant_tokens")) for item in daily_points)
+    transfer_in_tokens_recent = sum(_safe_int(item.get("transfer_in_tokens")) for item in daily_points)
+    transfer_out_tokens_recent = sum(_safe_int(item.get("transfer_out_tokens")) for item in daily_points)
     payment_minor_recent = sum(_safe_int(item.get("payment_minor")) for item in daily_points)
 
     recommendations = []
@@ -774,6 +855,8 @@ def build_admin_dashboard(
             "recent_debit_tokens": debit_tokens_recent,
             "recent_cashout_tokens": cashout_tokens_recent,
             "recent_grant_tokens": grant_tokens_recent,
+            "recent_transfer_in_tokens": transfer_in_tokens_recent,
+            "recent_transfer_out_tokens": transfer_out_tokens_recent,
             "recent_payment_minor": payment_minor_recent,
             "recent_payment_major": _money_major(payment_minor_recent),
             "anomalies_open": len(anomaly_queue),

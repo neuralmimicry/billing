@@ -128,6 +128,39 @@ def _verify_password(username: str, password: str) -> bool:
     return bool(payload.get("authenticated"))
 
 
+def _parse_token_amount(value: Any) -> int:
+    try:
+        if value in (None, ""):
+            return 0
+        return int(float(value))
+    except Exception:
+        return 0
+
+
+def _resolve_known_user(username: str) -> Optional[Dict[str, Any]]:
+    cleaned = str(username or "").strip()
+    if not cleaned:
+        return None
+    client = _customers()
+    if client:
+        payload = client.get_user(cleaned)
+        payload_user = str(payload.get("user") or "").strip()
+        user_record = payload.get("user_record") if isinstance(payload.get("user_record"), dict) else {}
+        record_user = str(user_record.get("username") or "").strip()
+        if payload_user == cleaned or record_user == cleaned:
+            return payload
+        return None
+    if _settings().auth_open:
+        return {
+            "authenticated": True,
+            "user": cleaned,
+            "role": "user",
+            "groups": ["user"],
+            "user_record": {"username": cleaned, "role": "user", "groups": ["user"]},
+        }
+    raise CustomersClientError("customers_not_configured")
+
+
 def _coerce_identity_groups(value: Any) -> list[str]:
     if isinstance(value, str):
         raw_values = [item.strip() for item in value.split(",") if item.strip()]
@@ -494,7 +527,7 @@ def create_app() -> Flask:
         if action == "review":
             return jsonify(snapshot)
 
-        if action in {"add", "cashout", "grant"}:
+        if action in {"add", "cashout", "grant", "transfer"}:
             password = str(payload.get("password") or "")
             if not password or not _verify_password(user, password):
                 return jsonify({"error": "invalid_credentials", "details": "Password verification failed."}), 401
@@ -552,10 +585,7 @@ def create_app() -> Flask:
             return jsonify({"message": "Tokens added.", **_user_snapshot(user)})
 
         if action == "cashout":
-            try:
-                tokens = int(float(payload.get("token_amount") or 0))
-            except Exception:
-                tokens = 0
+            tokens = _parse_token_amount(payload.get("token_amount"))
             if tokens <= 0:
                 return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
             if tokens > snapshot.get("paid_balance", snapshot.get("balance", 0)):
@@ -586,9 +616,14 @@ def create_app() -> Flask:
             if not target_user:
                 return jsonify({"error": "target_required", "details": "Target user is required."}), 400
             try:
-                tokens = int(float(payload.get("token_amount") or 0))
-            except Exception:
-                tokens = 0
+                target_identity = _resolve_known_user(target_user)
+            except CustomersClientError as exc:
+                logger.warning("customers lookup failed for grant target %s: %s", target_user, exc)
+                return jsonify({"error": "auth_unavailable"}), 503
+            if not target_identity:
+                return jsonify({"error": "target_not_found", "details": "Target user does not exist."}), 404
+            target_user = str(target_identity.get("user") or target_user).strip() or target_user
+            tokens = _parse_token_amount(payload.get("token_amount"))
             if tokens <= 0:
                 return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
             meta = {
@@ -611,11 +646,150 @@ def create_app() -> Flask:
                 return jsonify({"error": str(exc)}), 503
             return jsonify({"message": "Free tokens granted.", "target": target_user, **_user_snapshot(target_user)})
 
-        if action == "debit":
+        if action == "transfer":
+            target_user = str(payload.get("target_user") or payload.get("recipient") or "").strip()
+            if not target_user:
+                return jsonify({"error": "target_required", "details": "Recipient user is required."}), 400
+            if target_user == user:
+                return jsonify({"error": "self_transfer_forbidden", "details": "Transfer recipient must be another user."}), 400
+            tokens = _parse_token_amount(payload.get("token_amount"))
+            if tokens <= 0:
+                return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
+            if tokens > int(snapshot.get("available") or snapshot.get("balance") or 0):
+                return jsonify({"error": "insufficient_tokens", "details": "Not enough available tokens to transfer."}), 409
             try:
-                tokens = int(float(payload.get("token_amount") or 0))
-            except Exception:
-                tokens = 0
+                target_identity = _resolve_known_user(target_user)
+            except CustomersClientError as exc:
+                logger.warning("customers lookup failed for transfer target %s: %s", target_user, exc)
+                return jsonify({"error": "auth_unavailable"}), 503
+            if not target_identity:
+                return jsonify({"error": "target_not_found", "details": "Recipient user does not exist."}), 404
+            target_user = str(target_identity.get("user") or target_user).strip() or target_user
+            note = str(payload.get("note") or payload.get("reason") or "").strip() or None
+            transfer_id = str(payload.get("transfer_id") or "").strip() or f"billing-transfer:{user}:{target_user}:{uuid.uuid4().hex}"
+            transfer_source = payload.get("source") or "portal"
+            sender_meta = {
+                "tokens": tokens,
+                "source": transfer_source,
+                "transfer_id": transfer_id,
+                "from_user": user,
+                "to_user": target_user,
+                "note": note,
+            }
+            try:
+                sender_result = chain.apply_token(
+                    "user",
+                    user,
+                    entry_type="transfer_out",
+                    delta=-tokens,
+                    request_id=transfer_id,
+                    meta=sender_meta,
+                )
+            except NmChainError as exc:
+                logger.warning("transfer debit failed: %s", exc)
+                return jsonify({"error": str(exc)}), 503
+            sender_entry = sender_result.get("entry") if isinstance(sender_result.get("entry"), dict) else {}
+            sender_entry_meta = sender_entry.get("meta") if isinstance(sender_entry.get("meta"), dict) else {}
+            shortfall = int(sender_entry.get("shortfall") or sender_entry_meta.get("shortfall") or 0)
+            used_total = abs(int(sender_entry.get("delta") or 0))
+            if shortfall > 0 or used_total < tokens:
+                return jsonify(
+                    {
+                        "error": "insufficient_tokens",
+                        "details": "Not enough available tokens to transfer.",
+                        "requested": tokens,
+                        "used": used_total,
+                        "shortfall": max(shortfall, tokens - used_total),
+                        **_user_snapshot(user),
+                    }
+                ), 409
+
+            paid_tokens = int(sender_entry_meta.get("paid_used") or 0)
+            free_tokens = int(sender_entry_meta.get("free_used") or 0)
+            recipient_meta = {
+                "tokens": used_total,
+                "source": transfer_source,
+                "transfer_id": transfer_id,
+                "from_user": user,
+                "to_user": target_user,
+                "note": note,
+                "paid_tokens": paid_tokens,
+                "free_tokens": free_tokens,
+            }
+            try:
+                recipient_result = chain.apply_token(
+                    "user",
+                    target_user,
+                    entry_type="transfer_in",
+                    delta=used_total,
+                    request_id=transfer_id,
+                    meta=recipient_meta,
+                )
+            except NmChainError as exc:
+                logger.error("transfer credit failed for %s -> %s (%s), attempting rollback", user, target_user, transfer_id)
+                rollback_meta = {
+                    "tokens": used_total,
+                    "source": "billing_transfer_rollback",
+                    "transfer_id": transfer_id,
+                    "from_user": target_user,
+                    "to_user": user,
+                    "note": "automatic rollback",
+                    "paid_tokens": paid_tokens,
+                    "free_tokens": free_tokens,
+                }
+                try:
+                    chain.apply_token(
+                        "user",
+                        user,
+                        entry_type="transfer_in",
+                        delta=used_total,
+                        request_id=f"{transfer_id}:rollback",
+                        meta=rollback_meta,
+                    )
+                except NmChainError as rollback_exc:
+                    logger.error("transfer rollback failed for %s: %s", transfer_id, rollback_exc)
+                    return jsonify(
+                        {
+                            "error": "transfer_credit_failed",
+                            "details": "Recipient credit failed and the sender balance could not be restored automatically.",
+                            "transfer_id": transfer_id,
+                        }
+                    ), 503
+                logger.warning("transfer credit failed and was rolled back: %s", exc)
+                return jsonify(
+                    {
+                        "error": "transfer_credit_failed",
+                        "details": "Recipient credit failed and the sender balance was restored.",
+                        "transfer_id": transfer_id,
+                        **_user_snapshot(user),
+                    }
+                ), 503
+
+            return jsonify(
+                {
+                    "message": f"Transferred {used_total} tokens to {target_user}.",
+                    "transfer": {
+                        "id": transfer_id,
+                        "from_user": user,
+                        "to_user": target_user,
+                        "tokens": used_total,
+                        "paid_tokens": paid_tokens,
+                        "free_tokens": free_tokens,
+                        "note": note,
+                    },
+                    "recipient": {
+                        "user": target_user,
+                        "identity": target_identity,
+                        "snapshot": _user_snapshot(target_user),
+                        "entry": recipient_result.get("entry"),
+                    },
+                    "entry": sender_entry,
+                    **_user_snapshot(user),
+                }
+            )
+
+        if action == "debit":
+            tokens = _parse_token_amount(payload.get("token_amount"))
             if tokens <= 0:
                 return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
             meta = {
@@ -648,10 +822,7 @@ def create_app() -> Flask:
             return jsonify({"message": "Tokens debited.", "entry": entry, **_user_snapshot(user)})
 
         if action == "refund":
-            try:
-                tokens = int(float(payload.get("token_amount") or 0))
-            except Exception:
-                tokens = 0
+            tokens = _parse_token_amount(payload.get("token_amount"))
             if tokens <= 0:
                 return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
             meta = {

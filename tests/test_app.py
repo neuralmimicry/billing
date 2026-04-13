@@ -77,6 +77,7 @@ class FakeChain:
                     payment_id="pay_alice_1",
                 ),
                 self._entry(now - timedelta(days=4), "user", "alice", "debit", -70, source="api", operation="refiner-job"),
+                self._entry(now - timedelta(days=3, hours=6), "user", "alice", "transfer_out", -15, source="token_vault", from_user="alice", to_user="bob", transfer_id="transfer-1", note="team handoff"),
                 self._entry(now - timedelta(days=2), "user", "alice", "debit", -30, source="api", operation="nmstt-voice"),
                 self._entry(now - timedelta(days=1), "user", "alice", "cashout", -10, source="portal", btc_address="bc1alice"),
             ],
@@ -93,6 +94,7 @@ class FakeChain:
                     amount_minor=6400,
                     payment_id="pay_bob_1",
                 ),
+                self._entry(now - timedelta(days=3, hours=6), "user", "bob", "transfer_in", 15, source="token_vault", from_user="alice", to_user="bob", transfer_id="transfer-1", paid_tokens=15, free_tokens=0, note="team handoff"),
                 self._entry(now - timedelta(days=1, hours=12), "user", "bob", "debit", -160, source="api", operation="refiner-batch"),
                 self._entry(now - timedelta(days=1), "user", "bob", "cashout", -80, source="portal", btc_address="bc1bob"),
                 self._entry(now - timedelta(hours=12), "user", "bob", "debit", -60, source="api", operation="nmstt-voice", shortfall=12),
@@ -108,6 +110,34 @@ class FakeChain:
                 "index": 2,
                 "ts": (now - timedelta(days=2)).isoformat(),
                 "transactions": [
+                    {
+                        "ts": (now - timedelta(days=3, hours=6)).isoformat(),
+                        "actor_app": "billing",
+                        "request_id": "transfer-1",
+                        "tx_id": "tx-transfer-alice-1",
+                        "event": {
+                            "event": "token_mutation",
+                            "account_scope": "user",
+                            "account_id": "alice",
+                            "entry_type": "transfer_out",
+                            "delta": -15,
+                            "meta": {"source": "token_vault", "from_user": "alice", "to_user": "bob", "transfer_id": "transfer-1", "note": "team handoff"},
+                        },
+                    },
+                    {
+                        "ts": (now - timedelta(days=3, hours=6)).isoformat(),
+                        "actor_app": "billing",
+                        "request_id": "transfer-1",
+                        "tx_id": "tx-transfer-bob-1",
+                        "event": {
+                            "event": "token_mutation",
+                            "account_scope": "user",
+                            "account_id": "bob",
+                            "entry_type": "transfer_in",
+                            "delta": 15,
+                            "meta": {"source": "token_vault", "from_user": "alice", "to_user": "bob", "transfer_id": "transfer-1", "paid_tokens": 15, "free_tokens": 0, "note": "team handoff"},
+                        },
+                    },
                     {
                         "ts": (now - timedelta(days=2)).isoformat(),
                         "actor_app": "billing",
@@ -273,18 +303,16 @@ class FakeChain:
             "delta": delta,
             "shortfall": shortfall,
             "actor_app": meta.get("source") == "api" and "refiner" or "billing",
-            "request_id": meta.get("payment_id") or f"{entry_type}:{account_id}:{int(ts.timestamp())}",
+            "request_id": meta.get("payment_id") or meta.get("transfer_id") or f"{entry_type}:{account_id}:{int(ts.timestamp())}",
             "tx_id": f"tx:{account_id}:{entry_type}:{int(ts.timestamp())}",
             "meta": meta,
         }
 
     def account_snapshot(self, scope, account_id):
-        return self._snapshots[(scope, account_id)]
+        return dict(self._snapshots[(scope, account_id)])
 
     def ledger_entries(self, scope, account_id, limit=50):
-        return {
-            "entries": list(self._ledger.get((scope, account_id), []))[:limit],
-        }
+        return {"entries": list(self._ledger.get((scope, account_id), []))[:limit]}
 
     def chain_status(self):
         return {
@@ -302,37 +330,176 @@ class FakeChain:
         return {"blocks": list(self._blocks)[-limit:]}
 
     def apply_token(self, scope, account_id, *, entry_type, delta, request_id=None, meta=None):
-        snapshot = self.account_snapshot(scope, account_id)
+        snapshot = self._snapshots[(scope, account_id)]
+        meta = dict(meta or {})
+        requested_delta = int(delta or 0)
+        paid_balance = int(snapshot.get("paid_balance") or snapshot.get("balance") or 0)
+        free_balance = int(snapshot.get("free_balance") or 0)
+        reserved = int(snapshot.get("reserved") or 0)
+        shortfall = 0
+
+        if entry_type in {"topup", "refund"}:
+            if requested_delta > 0:
+                paid_balance += requested_delta
+            else:
+                requested_delta = 0
+        elif entry_type == "grant":
+            if requested_delta > 0:
+                free_balance += requested_delta
+            else:
+                requested_delta = 0
+        elif entry_type == "transfer_in":
+            if requested_delta <= 0:
+                requested_delta = abs(requested_delta)
+            desired = abs(requested_delta)
+            free_tokens = max(0, int(meta.get("free_tokens") or meta.get("free_used") or 0))
+            free_tokens = min(free_tokens, desired)
+            paid_tokens = max(0, int(meta.get("paid_tokens") or meta.get("paid_used") or (desired - free_tokens)))
+            paid_tokens = min(paid_tokens, desired - free_tokens)
+            paid_tokens += desired - free_tokens - paid_tokens
+            free_balance += free_tokens
+            paid_balance += paid_tokens
+            requested_delta = free_tokens + paid_tokens
+            meta["free_used"] = free_tokens
+            meta["paid_used"] = paid_tokens
+            meta["used_total"] = requested_delta
+        elif entry_type == "transfer_out":
+            if requested_delta >= 0:
+                requested_delta = -abs(requested_delta or 0)
+            desired = abs(requested_delta)
+            available = max(0, paid_balance + free_balance - reserved)
+            if desired > available:
+                shortfall = desired
+                meta["shortfall"] = shortfall
+                meta["free_used"] = 0
+                meta["paid_used"] = 0
+                meta["used_total"] = 0
+                requested_delta = 0
+            else:
+                free_used = min(free_balance, desired)
+                free_balance -= free_used
+                remaining = desired - free_used
+                paid_used = min(paid_balance, remaining)
+                paid_balance -= paid_used
+                meta["free_used"] = free_used
+                meta["paid_used"] = paid_used
+                meta["used_total"] = free_used + paid_used
+                requested_delta = -(free_used + paid_used)
+        elif entry_type == "cashout":
+            if requested_delta >= 0:
+                requested_delta = -abs(requested_delta)
+            desired = abs(requested_delta)
+            paid_used = min(paid_balance, desired)
+            paid_balance -= paid_used
+            shortfall = desired - paid_used
+            if shortfall:
+                meta["shortfall"] = shortfall
+            meta["paid_used"] = paid_used
+            meta["free_used"] = 0
+            meta["used_total"] = paid_used
+            requested_delta = -paid_used
+        elif entry_type == "debit":
+            if requested_delta >= 0:
+                requested_delta = -abs(requested_delta or 0)
+            desired = abs(requested_delta)
+            free_used = min(free_balance, desired)
+            free_balance -= free_used
+            remaining = desired - free_used
+            paid_used = min(paid_balance, remaining)
+            paid_balance -= paid_used
+            shortfall = remaining - paid_used
+            if shortfall:
+                meta["shortfall"] = shortfall
+            meta["free_used"] = free_used
+            meta["paid_used"] = paid_used
+            meta["used_total"] = free_used + paid_used
+            requested_delta = -(free_used + paid_used)
+
+        final_type = entry_type if requested_delta or entry_type in {"reserve", "release", "sync"} else "adjust"
+        balance_after = max(0, paid_balance + free_balance)
+        snapshot["paid_balance"] = paid_balance
+        snapshot["free_balance"] = free_balance
+        snapshot["balance"] = balance_after
+        snapshot["available"] = max(0, balance_after - reserved)
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+        snapshot["status"] = "low" if snapshot["available"] <= max(0, int(snapshot.get("last_topup_tokens") or balance_after) // 5) else "ok"
+        if final_type == "debit":
+            snapshot["spent_total"] = int(snapshot.get("spent_total") or 0) + int(meta.get("used_total") or abs(requested_delta) or 0)
+            snapshot["shortfall_total"] = int(snapshot.get("shortfall_total") or 0) + shortfall
+        if final_type == "cashout":
+            snapshot["cashout_total"] = int(snapshot.get("cashout_total") or 0) + abs(requested_delta)
+        if final_type == "grant":
+            snapshot["free_grant_total"] = int(snapshot.get("free_grant_total") or 0) + abs(requested_delta)
+        meta["paid_after"] = paid_balance
+        meta["free_after"] = free_balance
+        entry = self._entry(datetime.now(timezone.utc), scope, account_id, final_type, requested_delta, shortfall=shortfall, **meta)
+        if request_id:
+            entry["request_id"] = request_id
+        self._ledger.setdefault((scope, account_id), []).append(entry)
         return {
             "entry": {
                 "scope": scope,
                 "account_id": account_id,
-                "entry_type": entry_type,
-                "delta": delta,
-                "balance_after": int(snapshot.get("balance") or 0) + int(delta),
-                "request_id": request_id,
-                "meta": meta or {},
+                "entry_type": entry["entry_type"],
+                "delta": entry["delta"],
+                "shortfall": shortfall,
+                "balance_after": balance_after,
+                "request_id": entry["request_id"],
+                "meta": entry["meta"],
             },
-            "snapshot": snapshot,
+            "snapshot": dict(snapshot),
         }
 
     def capture_payment(self, user_id, *, tokens, request_id=None, meta=None, **_kwargs):
-        snapshot = self.account_snapshot("user", user_id)
+        snapshot = self._snapshots[("user", user_id)]
+        tokens = int(tokens)
+        snapshot["paid_balance"] = int(snapshot.get("paid_balance") or snapshot.get("balance") or 0) + tokens
+        snapshot["balance"] = int(snapshot.get("balance") or 0) + tokens
+        snapshot["available"] = int(snapshot.get("available") or 0) + tokens
+        snapshot["last_topup_tokens"] = tokens
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+        entry = self._entry(datetime.now(timezone.utc), "user", user_id, "topup", tokens, **(meta or {}))
+        if request_id:
+            entry["request_id"] = request_id
+        self._ledger.setdefault(("user", user_id), []).append(entry)
         return {
             "entry": {
                 "scope": "user",
                 "account_id": user_id,
-                "entry_type": "payment",
-                "delta": int(tokens),
-                "balance_after": int(snapshot.get("balance") or 0) + int(tokens),
-                "request_id": request_id,
-                "meta": meta or {},
+                "entry_type": "topup",
+                "delta": tokens,
+                "balance_after": int(snapshot.get("balance") or 0),
+                "request_id": entry["request_id"],
+                "meta": entry["meta"],
             },
-            "snapshot": snapshot,
+            "snapshot": dict(snapshot),
         }
 
 
-def _build_app(monkeypatch, *, auth_open=True):
+class FakeCustomersClient:
+    def __init__(self, *, users=None, passwords=None):
+        self._users = {
+            username: {
+                "authenticated": True,
+                "user": username,
+                "role": (payload or {}).get("role", "user"),
+                "groups": (payload or {}).get("groups", [(payload or {}).get("role", "user")]),
+                "user_record": {"username": username, **(payload or {})},
+            }
+            for username, payload in (users or {}).items()
+        }
+        self._passwords = dict(passwords or {})
+
+    def verify_credentials(self, username, password):
+        if self._passwords.get(username) != password:
+            return {"authenticated": False, "user": None, "role": None}
+        return self._users.get(username) or {"authenticated": True, "user": username, "role": "user", "groups": ["user"]}
+
+    def get_user(self, username):
+        return self._users.get(username, {"error": "user_not_found"})
+
+
+def _build_app(monkeypatch, *, auth_open=True, customers_client=None):
     monkeypatch.setenv("BILLING_APP_TOKENS", "refiner=test-refiner-token")
     monkeypatch.setenv("BILLING_AUTH_OPEN", "1" if auth_open else "0")
     monkeypatch.setenv("BILLING_REQUIRE_CUSTOMERS", "0")
@@ -340,7 +507,7 @@ def _build_app(monkeypatch, *, auth_open=True):
     monkeypatch.setenv("BILLING_CHAIN_API_TOKEN", "test-chain-token")
     app = create_app()
     app.extensions["nm_chain"] = FakeChain()
-    app.extensions["customers_client"] = None
+    app.extensions["customers_client"] = customers_client
     return app
 
 
@@ -390,6 +557,129 @@ def test_public_and_internal_account_routes_remain_stable(monkeypatch):
     assert ledger_response.get_json()["entries"][0]["entry_type"] == "grant"
 
 
+def test_user_can_transfer_tokens_to_another_user(monkeypatch):
+    customers_client = FakeCustomersClient(
+        users={"alice": {"role": "user"}, "bob": {"role": "user"}},
+        passwords={"alice": "correct horse battery staple"},
+    )
+    app = _build_app(monkeypatch, customers_client=customers_client)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/tokens",
+        headers={"X-Debug-User": "alice", "X-Debug-Role": "user"},
+        json={
+            "action": "transfer",
+            "username": "alice",
+            "recipient": "bob",
+            "password": "correct horse battery staple",
+            "token_amount": 15,
+            "note": "share tokens",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["balance"] == 110
+    assert payload["free_balance"] == 10
+    assert payload["recipient"]["snapshot"]["balance"] == 55
+    assert payload["transfer"]["to_user"] == "bob"
+    assert payload["transfer"]["free_tokens"] == 15
+    assert payload["transfer"]["paid_tokens"] == 0
+
+    alice_ledger = app.extensions["nm_chain"].ledger_entries("user", "alice", limit=20)["entries"]
+    bob_ledger = app.extensions["nm_chain"].ledger_entries("user", "bob", limit=20)["entries"]
+    assert alice_ledger[-1]["entry_type"] == "transfer_out"
+    assert alice_ledger[-1]["meta"]["to_user"] == "bob"
+    assert bob_ledger[-1]["entry_type"] == "transfer_in"
+    assert bob_ledger[-1]["meta"]["from_user"] == "alice"
+
+
+def test_transfer_rejects_negative_amounts(monkeypatch):
+    customers_client = FakeCustomersClient(
+        users={"alice": {"role": "user"}, "bob": {"role": "user"}},
+        passwords={"alice": "secret"},
+    )
+    app = _build_app(monkeypatch, customers_client=customers_client)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/tokens",
+        headers={"X-Debug-User": "alice", "X-Debug-Role": "user"},
+        json={
+            "action": "transfer",
+            "username": "alice",
+            "recipient": "bob",
+            "password": "secret",
+            "token_amount": -5,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "invalid_amount"
+
+
+def test_transfer_rejects_insufficient_available_balance(monkeypatch):
+    customers_client = FakeCustomersClient(
+        users={"alice": {"role": "user"}, "bob": {"role": "user"}},
+        passwords={"alice": "secret"},
+    )
+    app = _build_app(monkeypatch, customers_client=customers_client)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/tokens",
+        headers={"X-Debug-User": "alice", "X-Debug-Role": "user"},
+        json={
+            "action": "transfer",
+            "username": "alice",
+            "recipient": "bob",
+            "password": "secret",
+            "token_amount": 500,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "insufficient_tokens"
+
+
+def test_transfer_rejects_self_and_unknown_recipient(monkeypatch):
+    customers_client = FakeCustomersClient(
+        users={"alice": {"role": "user"}},
+        passwords={"alice": "secret"},
+    )
+    app = _build_app(monkeypatch, customers_client=customers_client)
+    client = app.test_client()
+
+    self_response = client.post(
+        "/api/tokens",
+        headers={"X-Debug-User": "alice", "X-Debug-Role": "user"},
+        json={
+            "action": "transfer",
+            "username": "alice",
+            "recipient": "alice",
+            "password": "secret",
+            "token_amount": 5,
+        },
+    )
+    assert self_response.status_code == 400
+    assert self_response.get_json()["error"] == "self_transfer_forbidden"
+
+    missing_response = client.post(
+        "/api/tokens",
+        headers={"X-Debug-User": "alice", "X-Debug-Role": "user"},
+        json={
+            "action": "transfer",
+            "username": "alice",
+            "recipient": "bob",
+            "password": "secret",
+            "token_amount": 5,
+        },
+    )
+    assert missing_response.status_code == 404
+    assert missing_response.get_json()["error"] == "target_not_found"
+
+
 def test_customer_dashboard_routes(monkeypatch):
     app = _build_app(monkeypatch)
     client = app.test_client()
@@ -402,7 +692,9 @@ def test_customer_dashboard_routes(monkeypatch):
     payload = api_response.get_json()
     assert payload["scope"] == "customer"
     assert payload["summary"]["balance_tokens"] == 125
-    assert payload["transactions"][0]["entry_type"] in {"cashout", "debit", "topup", "grant"}
+    assert payload["summary"]["transfer_out_tokens_30d"] == 15
+    assert payload["transactions"][0]["entry_type"] in {"cashout", "debit", "topup", "grant", "transfer_out"}
+    assert any(item["entry_type"] == "transfer_out" for item in payload["transactions"])
     assert "anomaly" in payload
 
     html_response = client.get(
@@ -431,6 +723,8 @@ def test_admin_dashboard_routes(monkeypatch):
     payload = api_response.get_json()
     assert payload["scope"] == "admin"
     assert payload["chain"]["height"] == 3
+    assert payload["portfolio"]["recent_transfer_in_tokens"] == 15
+    assert payload["portfolio"]["recent_transfer_out_tokens"] == 15
     assert payload["top_accounts"]
     assert payload["anomaly_queue"]
     assert any(item["account_ref"].startswith("user/") for item in payload["top_accounts"])
