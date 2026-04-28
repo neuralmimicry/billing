@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from billing_service.access import resolve_identity_service_access
 from billing_service.app import create_app
 
 
@@ -477,9 +478,10 @@ class FakeChain:
 
 
 class FakeCustomersClient:
-    def __init__(self, *, users=None, passwords=None):
+    def __init__(self, *, users=None, passwords=None, sessions=None):
         self._users = {
             username: {
+                **(payload or {}),
                 "authenticated": True,
                 "user": username,
                 "role": (payload or {}).get("role", "user"),
@@ -489,6 +491,14 @@ class FakeCustomersClient:
             for username, payload in (users or {}).items()
         }
         self._passwords = dict(passwords or {})
+        self._sessions = dict(sessions or {})
+
+    def resolve_session(self, *, authorization=None, cookie_header=None):
+        del cookie_header
+        raw = str(authorization or "").strip()
+        if raw.lower().startswith("bearer "):
+            raw = raw[7:].strip()
+        return dict(self._sessions.get(raw) or {"authenticated": False, "user": None, "role": None})
 
     def verify_credentials(self, username, password):
         if self._passwords.get(username) != password:
@@ -555,6 +565,65 @@ def test_public_and_internal_account_routes_remain_stable(monkeypatch):
     )
     assert ledger_response.status_code == 200
     assert ledger_response.get_json()["entries"][0]["entry_type"] == "grant"
+
+
+def test_internal_routes_accept_trusted_service_account_tokens(monkeypatch):
+    customers_client = FakeCustomersClient(
+        sessions={
+            "svc-refiner": {
+                "authenticated": True,
+                "identity_type": "service_account",
+                "service_account_id": "refiner",
+                "service_key": "refiner",
+                "user": "refiner",
+                "role": "service_account",
+                "groups": ["admin"],
+            },
+            "svc-tracey": {
+                "authenticated": True,
+                "identity_type": "service_account",
+                "service_account_id": "tracey",
+                "service_key": "tracey",
+                "user": "tracey",
+                "role": "service_account",
+                "groups": ["admin"],
+            },
+        }
+    )
+    app = _build_app(monkeypatch, auth_open=False, customers_client=customers_client)
+    client = app.test_client()
+
+    trusted_response = client.get(
+        "/api/internal/accounts/user/alice",
+        headers={"Authorization": "Bearer svc-refiner"},
+    )
+    assert trusted_response.status_code == 200
+    assert trusted_response.get_json()["balance"] == 125
+
+    forbidden_response = client.get(
+        "/api/internal/accounts/user/alice",
+        headers={"Authorization": "Bearer svc-tracey"},
+    )
+    assert forbidden_response.status_code == 403
+    assert forbidden_response.get_json()["error"] == "forbidden"
+
+
+def test_service_accounts_do_not_receive_default_billing_access():
+    service_access = resolve_identity_service_access(
+        {
+            "authenticated": True,
+            "identity_type": "service_account",
+            "user": "tracey-sync",
+            "role": "service_account",
+            "groups": ["ops"],
+            "service_access": {},
+        }
+    )
+
+    billing = service_access["billing"]
+    assert billing["access_level"] == "none"
+    assert billing["visible"] is False
+    assert billing["can_use"] is False
 
 
 def test_user_can_transfer_tokens_to_another_user(monkeypatch):
@@ -773,6 +842,86 @@ def test_admin_dashboard_accepts_admin_group(monkeypatch):
     body = html_response.get_data(as_text=True)
     assert "Groups: user, admin" in body
     assert "Active team: platform" in body
+
+
+def test_delegated_billing_control_can_access_admin_dashboard_and_grant(monkeypatch):
+    app = _build_app(monkeypatch)
+    client = app.test_client()
+
+    api_response = client.get(
+        "/api/billing/dashboard/admin",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=control",
+        },
+    )
+    assert api_response.status_code == 200
+
+    html_response = client.get(
+        "/billing/admin",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=control",
+        },
+    )
+    assert html_response.status_code == 200
+
+    grant_response = client.post(
+        "/api/tokens",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=control",
+        },
+        json={
+            "action": "grant",
+            "password": "irrelevant-in-auth-open",
+            "target_user": "bob",
+            "token_amount": 10,
+            "note": "delegated billing admin grant",
+        },
+    )
+    assert grant_response.status_code == 200
+    assert grant_response.get_json()["target"] == "bob"
+
+
+def test_user_without_billing_use_is_blocked(monkeypatch):
+    app = _build_app(monkeypatch)
+    client = app.test_client()
+
+    dashboard_response = client.get(
+        "/api/billing/dashboard/customer",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=none",
+        },
+    )
+    assert dashboard_response.status_code == 403
+    assert dashboard_response.get_json()["error"] == "forbidden"
+
+    tokens_response = client.get(
+        "/api/tokens",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=none",
+        },
+    )
+    assert tokens_response.status_code == 403
+    assert tokens_response.get_json()["error"] == "forbidden"
+
+    ledger_response = client.get(
+        "/api/tokens/ledger",
+        headers={
+            "X-Debug-User": "alice",
+            "X-Debug-Role": "user",
+            "X-Debug-Service-Access": "billing=none",
+        },
+    )
+    assert ledger_response.status_code == 403
 
 
 def test_dashboard_html_redirects_when_unauthenticated(monkeypatch):

@@ -33,7 +33,7 @@ Internal service dependencies:
 - Billing resolves browser identity through Customers `/api/session`
 - Billing verifies passwords through Customers `/api/internal/credentials/verify`
 - Billing writes ledger, payment, and identity-linked events to nmchain
-- Refiner calls Billing internal account/event/payment endpoints with an app token for non-browser workflows
+- Refiner calls Billing internal account/event/payment endpoints with a Customers-issued service-account bearer token for non-browser workflows
 
 ## Responsibilities
 
@@ -67,7 +67,7 @@ Public routes:
 - `GET|POST /api/tokens`
 - `GET /api/tokens/ledger`
 
-Internal routes protected by app tokens:
+Internal routes protected by trusted internal bearer tokens:
 
 - `GET /api/internal/accounts/<scope>/<account_id>`
 - `GET /api/internal/accounts/<scope>/<account_id>/ledger`
@@ -79,7 +79,7 @@ Internal routes protected by app tokens:
 Billing treats nmchain as the ledger of record.
 The service normalizes the chain response into the token-account payloads already expected by the existing frontend and Refiner code.
 
-Important behavior preserved from the embedded implementation:
+Important behaviour preserved from the embedded implementation:
 
 - balances do not go negative
 - shortfalls are tracked explicitly
@@ -87,14 +87,29 @@ Important behavior preserved from the embedded implementation:
 - free grants are tracked separately from paid balances
 - public token routes remain backward compatible for the website and Refiner UI
 
-## Authentication and authorization
+## Authentication and authorisation
 
 Billing uses two modes of identity verification:
 
 - browser/user routes call Customers `/api/session`
-- protected internal mutation routes require a Billing app token
+- protected internal mutation routes require either a Billing app token or a trusted Customers-issued service-account token whose `service_key` matches the internal allow-list
 
 Password-protected actions such as top-up confirmation, grants, and cashouts use Customers `/api/internal/credentials/verify` so password truth stays in the identity service.
+
+Billing now consumes the resolved `service_access` contract emitted by Customers instead of relying only on `role == admin`.
+
+Load-bearing service checks:
+
+- `billing:use` is required for customer dashboard, token balance, token ledger, transfer, top-up, and cash-out flows
+- `billing:control` is required for the operator/admin dashboard and token grants
+
+Compatibility behaviour during rollout:
+
+- if Customers already returns `service_access`, Billing uses it directly
+- if Billing is pointed at an older Customers payload without `service_access`, authenticated human users still fall back to `billing:use`
+- Customers-issued service-account bearer tokens never inherit that human fallback and must be granted `service_access.billing` explicitly
+- global `admin` role or `admin` group still fall back to `billing:control`
+- development headers can inject `X-Debug-Service-Access: billing=control` for local verification
 
 ## Billing Intelligence dashboards
 
@@ -179,13 +194,13 @@ Core runtime variables:
 Customers integration:
 
 - `BILLING_CUSTOMERS_API_BASE`
-- `BILLING_CUSTOMERS_API_TOKEN`
+- `BILLING_CUSTOMERS_API_TOKEN` (prefer the Billing Customers-issued service-account token; legacy app tokens remain accepted)
 - `BILLING_CUSTOMERS_TIMEOUT`
 
 nmchain integration:
 
 - `BILLING_CHAIN_API_BASE`
-- `BILLING_CHAIN_API_TOKEN`
+- `BILLING_CHAIN_API_TOKEN` (prefer the Billing Customers-issued service-account token when nmchain is using central session validation)
 - `BILLING_CHAIN_APP_ID`
 - `BILLING_CHAIN_TIMEOUT`
 
@@ -257,7 +272,7 @@ Role:
 Deployment defaults assume:
 
 - internal service URL `http://billing.billing.svc.cluster.local:5020`
-- a generated `refiner` app token for internal account/event/payment calls
+- a generated `refiner` app token for compatibility and a Customers-issued `refiner` service-account token for primary internal account/event/payment calls
 - Customers reachable at `http://customers.customers.svc.cluster.local:5010`
 - nmchain reachable at `http://nmchain.nmchain.svc.cluster.local:9080`
 
@@ -267,7 +282,7 @@ For the split platform to stay coherent:
 
 - Refiner should proxy `/billing`, `/billing/admin`, `/billing/assets/*`, `/api/billing/dashboard/customer`, and `/api/billing/dashboard/admin` to Billing
 - Refiner should proxy user token routes to Billing
-- Refiner should call Billing internal routes with the generated Billing app token
+- Refiner should call Billing internal routes with its own Customers-issued service-account token
 - Billing should resolve session and password truth from Customers
 - Billing should record final account events into nmchain
 

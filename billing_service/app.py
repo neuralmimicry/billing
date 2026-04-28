@@ -9,6 +9,14 @@ from urllib.parse import urlencode
 
 from flask import Flask, Response, jsonify, make_response, redirect, render_template, request, send_from_directory
 
+from .access import (
+    SERVICE_ACCESS_CONTROL,
+    SERVICE_ACCESS_USE,
+    access_at_least,
+    can_control_billing,
+    can_use_billing,
+    resolve_identity_service_access,
+)
 from .config import Settings
 from .customers_client import CustomersClient, CustomersClientError
 from .dashboard_analytics import build_admin_dashboard, build_customer_dashboard, extract_observed_accounts
@@ -54,9 +62,35 @@ def _match_app_token() -> Optional[str]:
     return None
 
 
+def _trusted_internal_service_keys() -> set[str]:
+    return {
+        str(app_id or "").strip()
+        for app_id in _settings().app_tokens.keys()
+        if str(app_id or "").strip()
+    }
+
+
+def _match_service_account_actor() -> Optional[str]:
+    identity = _identity_from_request()
+    if not isinstance(identity, dict):
+        return None
+    if str(identity.get("identity_type") or "").strip().lower() != "service_account":
+        return None
+    service_key = str(identity.get("service_key") or "").strip()
+    if not service_key or service_key not in _trusted_internal_service_keys():
+        return None
+    return service_key
+
+
 def require_app_token(view: Callable[..., Response]) -> Callable[..., Response]:
     def wrapper(*args: Any, **kwargs: Any) -> Response:
         actor = _match_app_token()
+        if not actor:
+            try:
+                actor = _match_service_account_actor()
+            except CustomersClientError as exc:
+                logger.warning("internal service-token resolution failed: %s", exc)
+                return jsonify({"error": "auth_unavailable"}), 503
         if not actor:
             return jsonify({"error": "forbidden"}), 403
         request.environ["nm.app_actor"] = actor
@@ -209,14 +243,25 @@ def _normalize_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     user = str(payload.get("user") or "").strip()
     if not user:
         return None
-    role = str(payload.get("role") or "user").strip().lower() or "user"
+    identity_type = str(payload.get("identity_type") or "").strip().lower() or None
+    default_role = "service_account" if identity_type == "service_account" else "user"
+    role = str(payload.get("role") or default_role).strip().lower() or default_role
     groups = _coerce_identity_groups(payload.get("groups"))
-    if role and role not in groups:
+    if role and role != "service_account" and role not in groups:
         groups.insert(0, role)
     active_team = _normalize_active_team(payload.get("active_team"))
+    service_access = resolve_identity_service_access(
+        {
+            **payload,
+            "identity_type": identity_type,
+        },
+        debug_value=request.headers.get("X-Debug-Service-Access"),
+    )
+    billing_access = str((service_access.get("billing") or {}).get("access_level") or "").strip().lower() or "none"
     return {
         **payload,
         "authenticated": bool(payload.get("authenticated")),
+        "identity_type": identity_type,
         "user": user,
         "role": role,
         "groups": groups,
@@ -224,6 +269,10 @@ def _normalize_identity(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str,
         "team_count": _coerce_optional_int(payload.get("team_count"), 1 if active_team else 0),
         "pending_invitation_count": _coerce_optional_int(payload.get("pending_invitation_count"), 0),
         "is_admin": role == "admin" or "admin" in groups,
+        "service_access": service_access,
+        "billing_access": billing_access,
+        "can_use_billing": access_at_least(billing_access, SERVICE_ACCESS_USE),
+        "can_control_billing": access_at_least(billing_access, SERVICE_ACCESS_CONTROL),
     }
 
 
@@ -315,13 +364,16 @@ def _dashboard_bootstrap(kind: str, *, identity: Dict[str, Any]) -> Dict[str, An
         "kind": kind,
         "identity": {
             "user": identity.get("user"),
+            "identity_type": identity.get("identity_type"),
             "role": identity.get("role"),
             "groups": groups,
             "active_team": identity.get("active_team"),
             "team_count": identity.get("team_count"),
             "pending_invitation_count": identity.get("pending_invitation_count"),
+            "billing_access": identity.get("billing_access"),
+            "service_access": identity.get("service_access"),
         },
-        "can_switch_dashboard": bool(identity.get("is_admin")),
+        "can_switch_dashboard": bool(identity.get("can_control_billing")),
         "endpoints": {
             "data": "/api/billing/dashboard/customer" if kind == "customer" else "/api/billing/dashboard/admin",
             "customer": "/billing",
@@ -401,6 +453,8 @@ def create_app() -> Flask:
             return make_response("Authentication backend unavailable.", 503)
         if not identity or not identity.get("user"):
             return _login_redirect()
+        if not can_use_billing(identity):
+            return make_response("Billing access required.", 403)
         return make_response(
             render_template(
                 "dashboard.html",
@@ -414,7 +468,7 @@ def create_app() -> Flask:
                 user_role=str(identity.get("role") or "user"),
                 user_groups=identity.get("groups") or [],
                 active_team_label=_active_team_label(identity),
-                can_switch_dashboard=bool(identity.get("is_admin")),
+                can_switch_dashboard=bool(identity.get("can_control_billing")),
                 api_origin_hint=_api_origin_hint(),
             )
         )
@@ -428,8 +482,8 @@ def create_app() -> Flask:
             return make_response("Authentication backend unavailable.", 503)
         if not identity or not identity.get("user"):
             return _login_redirect()
-        if not bool(identity.get("is_admin")):
-            return make_response("Admin role required.", 403)
+        if not can_control_billing(identity):
+            return make_response("Billing control access required.", 403)
         return make_response(
             render_template(
                 "dashboard.html",
@@ -475,6 +529,8 @@ def create_app() -> Flask:
             return jsonify({"error": "auth_unavailable"}), 503
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
+        if not can_use_billing(identity):
+            return jsonify({"error": "forbidden"}), 403
         try:
             payload = _customer_dashboard_payload(str(identity.get("user") or "").strip())
         except NmChainError as exc:
@@ -491,7 +547,7 @@ def create_app() -> Flask:
             return jsonify({"error": "auth_unavailable"}), 503
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
-        if not bool(identity.get("is_admin")):
+        if not can_control_billing(identity):
             return jsonify({"error": "forbidden"}), 403
         try:
             payload = _admin_dashboard_payload()
@@ -509,6 +565,8 @@ def create_app() -> Flask:
             return jsonify({"error": "auth_unavailable"}), 503
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
+        if not can_use_billing(identity):
+            return jsonify({"error": "forbidden", "details": "Billing access required."}), 403
         user = str(identity.get("user") or "").strip()
         try:
             snapshot = _user_snapshot(user)
@@ -610,8 +668,8 @@ def create_app() -> Flask:
             return jsonify({"message": "Cashout recorded.", **_user_snapshot(user)})
 
         if action == "grant":
-            if not bool(identity.get("is_admin")):
-                return jsonify({"error": "forbidden", "details": "Admin role required."}), 403
+            if not can_control_billing(identity):
+                return jsonify({"error": "forbidden", "details": "Billing control access required."}), 403
             target_user = str(payload.get("target_user") or payload.get("recipient") or payload.get("username") or "").strip()
             if not target_user:
                 return jsonify({"error": "target_required", "details": "Target user is required."}), 400
@@ -899,10 +957,12 @@ def create_app() -> Flask:
             return jsonify({"error": "auth_unavailable"}), 503
         if not identity or not identity.get("user"):
             return jsonify({"error": "unauthorized"}), 401
+        if not can_use_billing(identity):
+            return jsonify({"error": "forbidden"}), 403
         target = str(request.args.get("user") or "").strip()
         user = str(identity.get("user") or "").strip()
         if target:
-            if not bool(identity.get("is_admin")):
+            if not can_control_billing(identity):
                 return jsonify({"error": "forbidden"}), 403
             user = target
         try:
