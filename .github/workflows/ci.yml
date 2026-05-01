@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python (${{ matrix.runner_arch }})
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_arch: [X64, ARM64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Python provisioning
+        id: python-provision
+        run: |
+          source /etc/os-release
+          if [ "$(uname -m)" = "x86_64" ] && [ "$ID" = "ubuntu" ] && [ "$VERSION_ID" = "25.04" ]; then
+            echo "mode=system" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=setup-python" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Python
+        if: steps.python-provision.outputs.mode == 'setup-python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Select Python binary
+        run: |
+          if [ "${{ steps.python-provision.outputs.mode }}" = "system" ]; then
+            SOURCE_PYTHON=python3
+          else
+            SOURCE_PYTHON=python
+          fi
+          "$SOURCE_PYTHON" -c 'import sys; sys.exit(f"Python 3.13 required, found {sys.version}") if sys.version_info[:2] != (3, 13) else print(sys.version)'
+          VENV_DIR="$RUNNER_TEMP/billing-venv"
+          "$SOURCE_PYTHON" -m venv "$VENV_DIR"
+          echo "PYTHON_BIN=$VENV_DIR/bin/python" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: |
+          "$PYTHON_BIN" -m pip install --upgrade pip
+          "$PYTHON_BIN" -m pip install -e .[dev]
+
+      - name: Run tests
+        run: |
+          "$PYTHON_BIN" -m pytest -q
