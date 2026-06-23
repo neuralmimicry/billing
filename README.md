@@ -1,5 +1,13 @@
 # Billing
 
+## Sponsor NeuralMimicry
+
+This service provides open, auditable token accounting, payment capture, and ledger primitives for the NeuralMimicry platform — designed from the outset to be deployable independently of any single product. NeuralMimicry is an independent open-source initiative and we rely on community support to sustain this work.
+
+**[☕ Support us on Crowdfunder](https://www.crowdfunder.co.uk/p/qr/aWggxwPW?utm_campaign=sharemodal&utm_medium=referral&utm_source=shortlink)**
+
+---
+
 Billing is NeuralMimicry's dedicated token and settlement service.
 It owns account balances, ledger reads, payment capture, token grants/debits/cashouts, and the internal account APIs used by Refiner.
 
