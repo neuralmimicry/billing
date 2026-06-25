@@ -17,11 +17,11 @@ The billing and token-ledger code was extracted from Refiner so token accounting
 
 The service split is now:
 
-- Refiner: `/home/pbisaacs/Developer/neuralmimicry/rag_demo`
-- Customers: `/home/pbisaacs/Developer/neuralmimicry/customers`
-- Billing: `/home/pbisaacs/Developer/neuralmimicry/billing`
-- nmstt: `/home/pbisaacs/Developer/neuralmimicry/nmstt`
-- nmchain: `/home/pbisaacs/Developer/neuralmimicry/nmchain`
+- Refiner: `${NM_LOCAL_REPO_ROOT}/rag_demo`
+- Customers: `${NM_LOCAL_REPO_ROOT}/customers`
+- Billing: `${NM_LOCAL_REPO_ROOT}/billing`
+- nmstt: `${NM_LOCAL_REPO_ROOT}/nmstt`
+- nmchain: `${NM_LOCAL_REPO_ROOT}/nmchain`
 
 The public website still talks to `https://api.neuralmimicry.ai`.
 Refiner remains the single public backend origin and proxies user-facing token routes to Billing.
@@ -156,11 +156,11 @@ They combine NeuralMimicry-native approaches instead:
 
 Load-bearing implementation files:
 
-- `/home/pbisaacs/Developer/neuralmimicry/billing/billing_service/dashboard_anomaly.py`
-- `/home/pbisaacs/Developer/neuralmimicry/billing/billing_service/dashboard_analytics.py`
-- `/home/pbisaacs/Developer/neuralmimicry/billing/billing_service/templates/dashboard.html`
-- `/home/pbisaacs/Developer/neuralmimicry/billing/billing_service/static/dashboard.css`
-- `/home/pbisaacs/Developer/neuralmimicry/billing/billing_service/static/dashboard.js`
+- `${NM_LOCAL_REPO_ROOT}/billing/billing_service/dashboard_anomaly.py`
+- `${NM_LOCAL_REPO_ROOT}/billing/billing_service/dashboard_analytics.py`
+- `${NM_LOCAL_REPO_ROOT}/billing/billing_service/templates/dashboard.html`
+- `${NM_LOCAL_REPO_ROOT}/billing/billing_service/static/dashboard.css`
+- `${NM_LOCAL_REPO_ROOT}/billing/billing_service/static/dashboard.js`
 
 ## Auditing with nmchain
 
@@ -273,7 +273,7 @@ podman build -t ghcr.io/neuralmimicry/billing:latest -f Containerfile .
 
 Tenant playbook:
 
-- `/home/pbisaacs/Developer/swarmhpc/swarmhpc/ansible/continuum_tenant_billing_site.yml`
+- `${SWARMHPC_ROOT}/swarmhpc/ansible/continuum_tenant_billing_site.yml`
 
 Role:
 
@@ -298,4 +298,4 @@ For the split platform to stay coherent:
 
 See also:
 
-- `/home/pbisaacs/Developer/neuralmimicry/rag_demo/SERVICE_SPLIT_ARCHITECTURE.md`
+- `${NM_LOCAL_REPO_ROOT}/rag_demo/SERVICE_SPLIT_ARCHITECTURE.md`
