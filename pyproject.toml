@@ -11,6 +11,8 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
   "Flask>=3.0,<4",
   "requests>=2.32,<3",
+  "SQLAlchemy>=2.0,<3",
+  "psycopg[binary]>=3.2,<4",
 ]
 
 [project.optional-dependencies]
