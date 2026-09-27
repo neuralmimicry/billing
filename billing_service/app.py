@@ -429,6 +429,8 @@ def create_app() -> Flask:
     app.extensions["nm_settings"] = settings
     app.extensions["nm_chain"] = NmChainClient.from_env()
     app.extensions["customers_client"] = CustomersClient.from_env()
+    from .commerce import register_commerce
+    register_commerce(app)
 
     @app.before_request
     def _before_request() -> Optional[Response]:
@@ -585,87 +587,20 @@ def create_app() -> Flask:
         if action == "review":
             return jsonify(snapshot)
 
-        if action in {"add", "cashout", "grant", "transfer"}:
+        # Browser assertions are never evidence of payment or ledger authority.
+        # Verified payment callbacks and trusted internal workflows own credits.
+        if action in {"add", "refund", "sync", "cashout"}:
+            return jsonify({
+                "error": "verified_payment_required",
+                "details": "Use checkout to buy tokens, or request a refund against an existing payment.",
+            }), 409
+
+        if action in {"grant", "transfer"}:
             password = str(payload.get("password") or "")
             if not password or not _verify_password(user, password):
                 return jsonify({"error": "invalid_credentials", "details": "Password verification failed."}), 401
 
         chain = _require_chain()
-
-        if action == "add":
-            tokens_raw = payload.get("token_amount")
-            btc_raw = payload.get("btc_amount") or payload.get("btc_value")
-            tokens = 0
-            btc_value = None
-            if tokens_raw not in (None, ""):
-                try:
-                    tokens = int(float(tokens_raw))
-                except Exception:
-                    tokens = 0
-            elif btc_raw not in (None, ""):
-                try:
-                    btc_value = float(btc_raw)
-                    tokens = int(round(btc_value / settings.btc_rate))
-                except Exception:
-                    tokens = 0
-            if tokens <= 0:
-                return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
-            meta = {
-                "tokens": tokens,
-                "btc_amount": btc_value,
-                "btc_rate": settings.btc_rate,
-                "btc_txid": payload.get("btc_txid"),
-                "btc_address": payload.get("btc_address"),
-                "source": payload.get("source") or "portal",
-                "currency": payload.get("settlement_currency") or "GBP",
-                "payment_provider": payload.get("payment_provider"),
-                "payment_channel": payload.get("payment_channel"),
-                "payment_method": payload.get("payment_method"),
-                "checkout_flow": payload.get("checkout_flow"),
-                "payment_id": payload.get("payment_id") or payload.get("checkout_id"),
-            }
-            request_id = str(meta.get("payment_id") or meta.get("btc_txid") or "").strip() or f"billing-topup:{user}:{uuid.uuid4().hex}"
-            try:
-                chain.capture_payment(
-                    user,
-                    tokens=tokens,
-                    amount_minor=_safe_int(payload.get("amount_minor")),
-                    currency=str(meta.get("currency") or "").strip() or None,
-                    provider=str(meta.get("payment_provider") or "").strip() or None,
-                    payment_id=str(meta.get("payment_id") or "").strip() or None,
-                    checkout_flow=str(meta.get("checkout_flow") or "").strip() or None,
-                    request_id=request_id,
-                    meta=meta,
-                )
-            except NmChainError as exc:
-                logger.warning("payment capture failed: %s", exc)
-                return jsonify({"error": str(exc)}), 503
-            return jsonify({"message": "Tokens added.", **_user_snapshot(user)})
-
-        if action == "cashout":
-            tokens = _parse_token_amount(payload.get("token_amount"))
-            if tokens <= 0:
-                return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
-            if tokens > snapshot.get("paid_balance", snapshot.get("balance", 0)):
-                return jsonify({"error": "insufficient_tokens", "details": "Not enough tokens to cash out."}), 409
-            meta = {
-                "tokens": tokens,
-                "btc_address": payload.get("btc_address"),
-                "source": payload.get("source") or "portal",
-            }
-            try:
-                chain.apply_token(
-                    "user",
-                    user,
-                    entry_type="cashout",
-                    delta=-tokens,
-                    request_id=str(payload.get("payout_reference") or payload.get("settlement_reference") or "").strip() or f"billing-cashout:{user}:{uuid.uuid4().hex}",
-                    meta=meta,
-                )
-            except NmChainError as exc:
-                logger.warning("cashout failed: %s", exc)
-                return jsonify({"error": str(exc)}), 503
-            return jsonify({"message": "Cashout recorded.", **_user_snapshot(user)})
 
         if action == "grant":
             if not can_control_billing(identity):
@@ -878,73 +813,6 @@ def create_app() -> Flask:
                     }
                 ), 409
             return jsonify({"message": "Tokens debited.", "entry": entry, **_user_snapshot(user)})
-
-        if action == "refund":
-            tokens = _parse_token_amount(payload.get("token_amount"))
-            if tokens <= 0:
-                return jsonify({"error": "invalid_amount", "details": "Token amount must be positive."}), 400
-            meta = {
-                "tokens": tokens,
-                "source": payload.get("source") or "api",
-                "note": payload.get("note") or payload.get("reason"),
-                "operation": payload.get("operation"),
-                "workspace_id": payload.get("workspace_id"),
-            }
-            request_id = str(payload.get("request_id") or payload.get("operation_id") or "").strip() or f"billing-refund:{user}:{uuid.uuid4().hex}"
-            try:
-                result = chain.apply_token("user", user, entry_type="refund", delta=tokens, request_id=request_id, meta=meta)
-            except NmChainError as exc:
-                logger.warning("refund failed: %s", exc)
-                return jsonify({"error": str(exc)}), 503
-            return jsonify({"message": "Tokens refunded.", "entry": result.get("entry"), **_user_snapshot(user)})
-
-        if action == "sync":
-            target = payload.get("balance")
-            if target is None:
-                return jsonify({"error": "balance_required"}), 400
-            try:
-                target_balance = int(float(target))
-            except Exception:
-                return jsonify({"error": "invalid_balance"}), 400
-            if target_balance < 0:
-                return jsonify({"error": "invalid_balance"}), 400
-            capacity = payload.get("capacity") or payload.get("last_topup_tokens")
-            try:
-                capacity_val = int(float(capacity)) if capacity not in (None, "") else None
-            except Exception:
-                capacity_val = None
-            target_paid = payload.get("paid_balance")
-            target_free = payload.get("free_balance")
-            try:
-                target_paid_val = int(float(target_paid)) if target_paid not in (None, "") else None
-            except Exception:
-                target_paid_val = None
-            try:
-                target_free_val = int(float(target_free)) if target_free not in (None, "") else None
-            except Exception:
-                target_free_val = None
-            delta = target_balance - int(snapshot.get("balance") or 0)
-            try:
-                chain.apply_token(
-                    "user",
-                    user,
-                    entry_type="sync",
-                    delta=delta,
-                    meta={
-                        "target_balance": target_balance,
-                        "capacity": capacity_val,
-                        "source": payload.get("source") or "portal",
-                        "sync_user": payload.get("user") or user,
-                        "sync_role": payload.get("role"),
-                        "target_paid_balance": target_paid_val,
-                        "target_free_balance": target_free_val,
-                    },
-                )
-            except NmChainError as exc:
-                logger.warning("sync failed: %s", exc)
-                return jsonify({"error": str(exc)}), 503
-            status = "matched" if delta == 0 else "adjusted"
-            return jsonify({"message": "Sync complete.", "status": status, **_user_snapshot(user)})
 
         return jsonify({"error": "invalid_action"}), 400
 

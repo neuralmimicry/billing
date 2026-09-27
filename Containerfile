@@ -1,3 +1,4 @@
+ARG TARGET_PAGE_SIZE=4k
 FROM python:3.13-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -27,6 +28,8 @@ for cache_dir in sorted(package_dir.rglob("__pycache__"), reverse=True):
 PY
 
 FROM python:3.13-slim
+ARG TARGET_PAGE_SIZE
+LABEL org.opencontainers.image.page-size="${TARGET_PAGE_SIZE}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

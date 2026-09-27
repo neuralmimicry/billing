@@ -60,6 +60,10 @@ class CustomersClient:
             require_app_auth=True,
         )
 
+    def payment_details_changed(self, username: str, event_id: str) -> Dict[str, Any]:
+        return self._request("POST", f"/api/internal/users/{quote(username, safe='')}/payment-details-changed",
+                             json_body={"event_id": event_id}, require_app_auth=True)
+
     def _request(
         self,
         method: str,
