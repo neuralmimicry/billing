@@ -41,3 +41,9 @@ COPY --from=builder /opt/venv /opt/venv
 
 EXPOSE 5020
 CMD ["python", "-m", "billing_service"]
+
+# OCI metadata (final stage) so GHCR links the package to its source repository.
+LABEL org.opencontainers.image.source="https://github.com/neuralmimicry/billing" \
+      org.opencontainers.image.url="https://github.com/neuralmimicry/billing" \
+      org.opencontainers.image.description="Token accounting, payment capture, and auditable ledger service for the NeuralMimicry platform" \
+      org.opencontainers.image.vendor="NeuralMimicry"

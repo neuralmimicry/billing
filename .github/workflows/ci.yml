@@ -18,6 +18,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Check OCI source labels
+        shell: bash
+        run: |
+          # GHCR links a package to its repo via org.opencontainers.image.source;
+          # every Containerfile/Dockerfile (incl. templates) must carry it.
+          want="org.opencontainers.image.source=\"https://github.com/${GITHUB_REPOSITORY}\""
+          status=0
+          while IFS= read -r f; do
+            grep -qF "$want" "$f" || { echo "::error file=$f::missing $want"; status=1; }
+          done < <(git ls-files | grep -iE '(^|/)(containerfile|dockerfile)[^/]*$|\.(containerfile|dockerfile)(\.j2)?$' | grep -viE '\.(md|py|sh|txt|ya?ml|json)$')
+          exit "$status"
 
       - name: Select Python provisioning
         id: python-provision
@@ -100,7 +111,10 @@ jobs:
             ghcr.io/neuralmimicry/billing:latest
             ghcr.io/neuralmimicry/billing:sha-${{ github.sha }}
           labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/neuralmimicry/billing
             org.opencontainers.image.revision=${{ github.sha }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/neuralmimicry/billing
+            index:org.opencontainers.image.description=Token accounting, payment capture, and auditable ledger service for the NeuralMimicry platform
           cache-from: type=gha
           cache-to: type=gha,mode=max
