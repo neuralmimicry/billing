@@ -20,7 +20,7 @@ from urllib.parse import urlencode, urlsplit, parse_qsl
 
 import click
 from flask import Blueprint, current_app, jsonify, redirect, request
-from sqlalchemy import Column, Integer, MetaData, String, Table, Text, UniqueConstraint, create_engine, insert, select, update
+from sqlalchemy import Column, Integer, MetaData, String, Table, Text, UniqueConstraint, create_engine, insert, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .access import can_control_billing, can_use_billing
@@ -544,7 +544,15 @@ def register_commerce(app):
     @app.cli.command("init-commerce-db")
     def init_commerce_db():
         """Create the initial commerce schema in the configured PostgreSQL database."""
-        metadata.create_all(_engine())
+        engine = _engine()
+        with engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                # Each Billing replica runs this init command before serving.
+                # Serialize create_all so simultaneous pod starts cannot race
+                # while checking and creating the same tables.
+                connection.execute(text("SELECT pg_advisory_xact_lock(:namespace, :object)"),
+                                   {"namespace": 90210, "object": 5020})
+            metadata.create_all(bind=connection)
         click.echo("Commerce schema ready.")
 
     register_error_handlers(app)

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 
 from billing_service.app import create_app
 from billing_service.commerce import metadata
+from billing_service.infrastructure_budgets import budgets
 
 
 def _new_budget_app(monkeypatch, tmp_path):
@@ -30,6 +31,25 @@ def _admin_headers():
 
 def _service_headers(service: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {service}-test-token"}
+
+
+def test_schema_command_creates_budget_tables_idempotently(monkeypatch, tmp_path):
+    monkeypatch.delenv("BILLING_DATABASE_URL", raising=False)
+    monkeypatch.setenv("BILLING_APP_TOKENS", "refiner=refiner-test-token")
+    monkeypatch.setenv("BILLING_AUTH_OPEN", "1")
+    monkeypatch.setenv("BILLING_REQUIRE_CUSTOMERS", "0")
+    app = create_app()
+    app.config["TESTING"] = True
+    engine = create_engine(f"sqlite:///{tmp_path / 'billing-schema.sqlite'}")
+    app.extensions["commerce_engine"] = engine
+
+    result = app.test_cli_runner().invoke(args=["init-commerce-db"])
+    assert result.exit_code == 0, result.output
+    assert inspect(engine).has_table(budgets.name)
+
+    second_result = app.test_cli_runner().invoke(args=["init-commerce-db"])
+    assert second_result.exit_code == 0, second_result.output
+    engine.dispose()
 
 
 def _create_budget(client, *, ceiling=1000, providers=None, key="maintenance-1"):
