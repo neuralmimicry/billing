@@ -71,7 +71,7 @@ def _create_budget(client, *, ceiling=1000, providers=None, key="maintenance-1")
     return response.get_json()["budget"]
 
 
-def _hold_payload(budget_id: str, *, request_id="maintenance-1/compute", amount=700, provider="aws"):
+def _hold_payload(budget_id: str, *, request_id="maintenance-1:compute", amount=700, provider="aws"):
     expires = datetime.now(timezone.utc) + timedelta(hours=1)
     return {
         "budget_id": budget_id,
@@ -114,7 +114,7 @@ def test_billing_admin_approves_budget_and_conductor_reserves_atomically(monkeyp
     exhausted = client.post(
         "/api/internal/infrastructure/budget-holds",
         headers=_service_headers("conductor"),
-        json=_hold_payload(budget["budget_id"], request_id="maintenance-1/extra", amount=301),
+        json=_hold_payload(budget["budget_id"], request_id="maintenance-1:extra", amount=301),
     )
     assert exhausted.status_code == 409
     assert exhausted.get_json()["error"] == "budget_ceiling_exceeded"
@@ -178,7 +178,7 @@ def test_budget_window_provider_and_currency_are_enforced(monkeypatch, tmp_path)
     assert denied_provider.status_code == 403
     assert denied_provider.get_json()["error"] == "provider_not_approved"
 
-    wrong_currency = _hold_payload(budget["budget_id"], request_id="maintenance-1/wrong-currency")
+    wrong_currency = _hold_payload(budget["budget_id"], request_id="maintenance-1:wrong-currency")
     wrong_currency["currency"] = "GBP"
     denied_currency = client.post(
         "/api/internal/infrastructure/budget-holds",
@@ -209,7 +209,7 @@ def test_actual_cost_overrun_is_recorded_and_consumes_budget(monkeypatch, tmp_pa
     blocked = client.post(
         "/api/internal/infrastructure/budget-holds",
         headers=_service_headers("conductor"),
-        json=_hold_payload(budget["budget_id"], request_id="maintenance-1/after-overrun", amount=1),
+        json=_hold_payload(budget["budget_id"], request_id="maintenance-1:after-overrun", amount=1),
     )
     assert blocked.status_code == 409
     assert blocked.get_json()["error"] == "budget_ceiling_exceeded"
@@ -236,7 +236,7 @@ def test_admin_can_disable_future_reservations_without_erasing_live_holds(monkey
     blocked = client.post(
         "/api/internal/infrastructure/budget-holds",
         headers=_service_headers("conductor"),
-        json=_hold_payload(budget["budget_id"], request_id="maintenance-1/new", amount=1),
+        json=_hold_payload(budget["budget_id"], request_id="maintenance-1:new", amount=1),
     )
     assert blocked.status_code == 409
     assert blocked.get_json()["error"] == "budget_not_active"
