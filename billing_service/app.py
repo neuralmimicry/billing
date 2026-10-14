@@ -7,7 +7,7 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode
 
-from flask import Flask, Response, jsonify, make_response, redirect, render_template, request, send_from_directory
+from flask import Flask, Response, current_app, jsonify, make_response, redirect, render_template, request, send_from_directory
 
 from .access import (
     SERVICE_ACCESS_CONTROL,
@@ -20,6 +20,7 @@ from .access import (
 from .config import Settings
 from .customers_client import CustomersClient, CustomersClientError
 from .dashboard_analytics import build_admin_dashboard, build_customer_dashboard, extract_observed_accounts
+from .infrastructure_budgets import BudgetError, create_budget, create_hold, disable_budget, get_hold, list_budget_events, list_budgets, reconcile_hold
 from .nmchain_client import NmChainClient, NmChainError
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,21 @@ def _customers() -> Optional[CustomersClient]:
     from flask import current_app
 
     return current_app.extensions.get("customers_client")
+
+
+def _budget_engine():
+    return current_app.extensions.get("commerce_engine")
+
+
+def _budget_failure(error: BudgetError) -> Response:
+    return jsonify({"error": error.code}), error.status
+
+
+def _budget_limit(value: Any, default: int, maximum: int) -> int:
+    try:
+        return max(1, min(int(value or default), maximum))
+    except (TypeError, ValueError):
+        return default
 
 
 def _extract_bearer_token(auth_header: Optional[str]) -> Optional[str]:
@@ -558,6 +574,78 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 503
         return jsonify(payload)
 
+    @app.route("/api/billing/admin/infrastructure-budgets", methods=["GET", "POST"])
+    def api_billing_infrastructure_budgets() -> Response:
+        try:
+            identity = _identity_from_request()
+        except CustomersClientError:
+            return jsonify({"error": "auth_unavailable"}), 503
+        if not identity or not identity.get("user"):
+            return jsonify({"error": "unauthorized"}), 401
+        if not can_control_billing(identity):
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        if request.method == "GET":
+            return jsonify({"budgets": list_budgets(engine, _budget_limit(request.args.get("limit"), 100, 200))})
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid_json_body"}), 400
+        try:
+            budget, idempotent = create_budget(engine, payload, str(identity["user"]))
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        return jsonify({"budget": budget, "idempotent": idempotent}), 200 if idempotent else 201
+
+    @app.route("/api/billing/admin/infrastructure-budgets/<budget_id>/events")
+    def api_billing_infrastructure_budget_events(budget_id: str) -> Response:
+        try:
+            identity = _identity_from_request()
+        except CustomersClientError:
+            return jsonify({"error": "auth_unavailable"}), 503
+        if not identity or not identity.get("user"):
+            return jsonify({"error": "unauthorized"}), 401
+        if not can_control_billing(identity):
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        try:
+            events = list_budget_events(engine, budget_id, _budget_limit(request.args.get("limit"), 200, 500))
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        if not events:
+            return jsonify({"error": "budget_not_found"}), 404
+        return jsonify({"events": events})
+
+    @app.route("/api/billing/admin/infrastructure-budgets/<budget_id>/disable", methods=["POST"])
+    def api_billing_disable_infrastructure_budget(budget_id: str) -> Response:
+        try:
+            identity = _identity_from_request()
+        except CustomersClientError:
+            return jsonify({"error": "auth_unavailable"}), 503
+        if not identity or not identity.get("user"):
+            return jsonify({"error": "unauthorized"}), 401
+        if not can_control_billing(identity):
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid_json_body"}), 400
+        try:
+            budget, idempotent = disable_budget(
+                engine,
+                budget_id,
+                payload.get("reason"),
+                str(identity["user"]),
+            )
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        return jsonify({"budget": budget, "idempotent": idempotent})
+
     @app.route("/api/tokens", methods=["GET", "POST"])
     def api_tokens() -> Response:
         try:
@@ -844,6 +932,56 @@ def create_app() -> Flask:
             logger.warning("ledger lookup failed: %s", exc)
             return jsonify({"error": str(exc)}), 503
         return jsonify({"entries": payload.get("entries") if isinstance(payload, dict) else []})
+
+    @app.route("/api/internal/infrastructure/budget-holds", methods=["POST"])
+    @require_app_token
+    def api_internal_infrastructure_budget_hold() -> Response:
+        if request.environ.get("nm.app_actor") != "conductor":
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid_json_body"}), 400
+        try:
+            hold, idempotent = create_hold(engine, payload, "conductor")
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        return jsonify({"hold": hold, "idempotent": idempotent}), 200 if idempotent else 201
+
+    @app.route("/api/internal/infrastructure/budget-holds/<hold_id>")
+    @require_app_token
+    def api_internal_infrastructure_budget_hold_status(hold_id: str) -> Response:
+        if request.environ.get("nm.app_actor") not in {"conductor", "continuum"}:
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        try:
+            hold = get_hold(engine, hold_id)
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        if not hold:
+            return jsonify({"error": "hold_not_found"}), 404
+        return jsonify({"hold": hold})
+
+    @app.route("/api/internal/infrastructure/budget-holds/<hold_id>/reconcile", methods=["POST"])
+    @require_app_token
+    def api_internal_infrastructure_budget_hold_reconcile(hold_id: str) -> Response:
+        if request.environ.get("nm.app_actor") != "continuum":
+            return jsonify({"error": "forbidden"}), 403
+        engine = _budget_engine()
+        if not engine:
+            return jsonify({"error": "billing_storage_unavailable"}), 503
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid_json_body"}), 400
+        try:
+            hold, idempotent = reconcile_hold(engine, hold_id, payload, "continuum")
+        except BudgetError as exc:
+            return _budget_failure(exc)
+        return jsonify({"hold": hold, "idempotent": idempotent}), 200
 
     @app.route("/api/internal/accounts/<scope>/<account_id>")
     @require_app_token

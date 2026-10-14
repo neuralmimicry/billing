@@ -283,6 +283,7 @@ Deployment defaults assume:
 
 - internal service URL `http://billing.billing.svc.cluster.local:5020`
 - a generated `refiner` app token for compatibility and a Customers-issued `refiner` service-account token for primary internal account/event/payment calls
+- infrastructure budget routes accept only the internal `conductor` token for holds and `continuum` token for provider-cost reconciliation; these must be added through the existing secret-management path before integration
 - Customers reachable at `http://customers.customers.svc.cluster.local:5010`
 - nmchain reachable at `http://nmchain.nmchain.svc.cluster.local:9080`
 
@@ -298,4 +299,5 @@ For the split platform to stay coherent:
 
 See also:
 
+- [Infrastructure budget and provider-cost hold contract](docs/INFRASTRUCTURE_BUDGETS.md)
 - `${NM_LOCAL_REPO_ROOT}/rag_demo/SERVICE_SPLIT_ARCHITECTURE.md`
